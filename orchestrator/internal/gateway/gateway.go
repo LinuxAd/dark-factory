@@ -15,6 +15,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,6 +54,9 @@ type Server struct {
 	ready atomic.Bool
 	key   string       // written once in Init, read only after ready is set
 	store *store.Store // likewise
+
+	mu     sync.Mutex // orders the end of Init against Close
+	closed bool
 }
 
 // New builds a Server that is not ready until Init succeeds.
@@ -118,17 +122,29 @@ func (s *Server) Init(ctx context.Context, keys secrets.KeySource, dsn string) e
 		st.Close()
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		st.Close()
+		return errClosed
+	}
 	s.key, s.store = key, st
 	s.ready.Store(true)
 	s.log.Info("gateway ready")
 	return nil
 }
 
+var errClosed = errors.New("gateway closed during startup")
+
 // Ready reports whether Init has finished.
 func (s *Server) Ready() bool { return s.ready.Load() }
 
-// Close releases the database pool.
+// Close releases the database pool. It is safe to call while Init is still
+// running: Init then closes the pool it opened and returns an error.
 func (s *Server) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
 	if s.store != nil {
 		s.store.Close()
 	}

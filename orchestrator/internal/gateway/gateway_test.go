@@ -1001,6 +1001,60 @@ func TestInitGivesUpWhenContextEnds(t *testing.T) {
 	}
 }
 
+// Close called while Init is running (as serve's deferred Close does when a
+// signal arrives during startup) must not race Init, and must not leave the
+// pool Init opened behind. Run with -race.
+func TestCloseDuringInit(t *testing.T) {
+	for name, cancelFirst := range map[string]bool{"close only": false, "cancel then close": true} {
+		t.Run(name, func(t *testing.T) {
+			dsn := testpg.New(t)
+			u, _ := url.Parse("http://127.0.0.1:1")
+			s := New(Config{Upstream: u, Logger: slog.New(slog.DiscardHandler), BackoffBase: 10 * time.Millisecond})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			started := make(chan struct{})
+			keys := keyFunc(func(context.Context) (string, error) {
+				close(started)
+				return testKey, nil
+			})
+			errc := make(chan error, 1)
+			go func() { errc <- s.Init(ctx, keys, dsn) }()
+			<-started
+			if cancelFirst {
+				cancel()
+			}
+			s.Close()
+			err := <-errc
+			if err == nil && !s.Ready() {
+				t.Error("Init returned nil but the server is not ready")
+			}
+			// Whichever finished first, no connection may remain open.
+			pu, _ := url.Parse(dsn)
+			conn, cerr := pgx.Connect(context.Background(), dsn)
+			if cerr != nil {
+				t.Fatal(cerr)
+			}
+			defer func() { _ = conn.Close(context.Background()) }()
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				var n int
+				if err := conn.QueryRow(context.Background(),
+					`SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
+					strings.TrimPrefix(pu.Path, "/")).Scan(&n); err != nil {
+					t.Fatal(err)
+				}
+				if n == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("%d connections still open after Close (Init err %v)", n, err)
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		})
+	}
+}
+
 type keyFunc func(context.Context) (string, error)
 
 func (f keyFunc) FetchKey(ctx context.Context) (string, error) { return f(ctx) }
