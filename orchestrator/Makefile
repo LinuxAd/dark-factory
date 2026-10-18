@@ -13,7 +13,7 @@ DOCKER_GO := docker run --rm \
 GOFLAGS_TEST ?= -race -count=1
 TEST_PKGS    ?= ./...
 
-.PHONY: test test-unit lint build tidy clean
+.PHONY: test test-unit lint build image tidy clean
 
 # test: starts a throwaway Postgres container, runs every test (unit and
 # integration) in a Go container sharing its network namespace, then removes
@@ -45,6 +45,10 @@ lint:
 build:
 	$(DOCKER_GO) -e CGO_ENABLED=0 -e GOOS=linux $(GO_IMAGE) \
 		go build -trimpath -ldflags='-s -w' -o bin/gateway ./cmd/gateway
+
+# image: the gateway container (context is the repo root for ../memory).
+image:
+	docker build -f Dockerfile -t factory-gateway:dev $(REPO_ROOT)
 
 tidy:
 	$(DOCKER_GO) $(GO_IMAGE) go mod tidy
