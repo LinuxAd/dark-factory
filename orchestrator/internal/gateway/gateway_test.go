@@ -676,7 +676,7 @@ func TestRequestBodyLimit(t *testing.T) {
 	tok := e.token(t, store.Token{RunID: "run-body", Stage: "build"})
 	send := func(n int64, hideLength bool) (*http.Response, []byte) {
 		t.Helper()
-		var body io.Reader = io.LimitReader(zeros{}, n)
+		body := io.LimitReader(zeros{}, n)
 		if hideLength {
 			body = io.MultiReader(body) // unknown length: sent chunked
 		}
@@ -822,6 +822,38 @@ func TestUnknownTokenCachedBriefly(t *testing.T) {
 	now.Store(&expired)
 	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 200 {
 		t.Fatalf("after the entry expired: status %d, want 200", resp.StatusCode)
+	}
+}
+
+type panicBudget struct{ v any }
+
+func (b panicBudget) Check(context.Context, Caller) error { panic(b.v) }
+
+// Only http.ErrAbortHandler (ReverseProxy on a broken copy) counts as 499;
+// any other panic is a gateway bug and counts as 500.
+func TestPanicStatus(t *testing.T) {
+	for name, c := range map[string]struct {
+		v    any
+		want string
+	}{
+		"abort": {http.ErrAbortHandler, "499"},
+		"bug":   {"boom", "500"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnvWith(t, serveFixture(t, "message.json"), func(cfg *Config) { cfg.Budget = panicBudget{c.v} })
+			tok := e.token(t, store.Token{RunID: "run-panic", Stage: "build"})
+			req, _ := http.NewRequest(http.MethodPost, e.front.URL+"/v1/messages/count_tokens", strings.NewReader("{}"))
+			req.Header.Set("Authorization", "Bearer "+tok)
+			if resp, err := http.DefaultClient.Do(req); err == nil {
+				_ = resp.Body.Close()
+			}
+			if got := testutil.ToFloat64(e.srv.metrics.requests.WithLabelValues(c.want)); got != 1 {
+				t.Errorf("gateway_requests_total{code=%s} = %v, want 1", c.want, got)
+			}
+			if !strings.Contains(e.logs.String(), `"status":`+c.want) {
+				t.Errorf("no request log with status %s:\n%s", c.want, e.logs.String())
+			}
+		})
 	}
 }
 

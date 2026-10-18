@@ -351,9 +351,14 @@ func (s *Server) instrument(next http.Handler) http.Handler {
 		sw := &statusWriter{ResponseWriter: w}
 		defer func() {
 			p := recover()
+			pErr, _ := p.(error)
 			code := sw.code()
-			if p != nil || r.Context().Err() != nil {
+			switch {
+			case errors.Is(pErr, http.ErrAbortHandler) || (p == nil && r.Context().Err() != nil):
 				code = statusClientClosed
+			case p != nil:
+				code = http.StatusInternalServerError
+				s.log.Error("handler panic", "path", r.URL.Path, "panic", fmt.Sprint(p))
 			}
 			elapsed := time.Since(ri.start)
 			s.metrics.requests.WithLabelValues(fmt.Sprint(code)).Inc()
@@ -366,7 +371,7 @@ func (s *Server) instrument(next http.Handler) http.Handler {
 				"run_id", ri.caller.RunID, "task_id", ri.caller.TaskID, "stage", ri.caller.Stage,
 				"model", ri.model)
 			if p != nil {
-				panic(p) // http.ErrAbortHandler from ReverseProxy on a broken copy
+				panic(p) // net/http aborts the connection (and logs a non-abort panic)
 			}
 		}()
 		next.ServeHTTP(sw, r)
