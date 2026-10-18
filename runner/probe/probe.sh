@@ -14,7 +14,6 @@ GATEWAY="${ANTHROPIC_BASE_URL:-}"
 TOKEN="${ANTHROPIC_AUTH_TOKEN:-}"
 DB_HOST="${PROBE_DB_HOST:-factory-db-rw.factory.svc.cluster.local}"
 DB_PORT="${PROBE_DB_PORT:-5432}"
-SETTLE_SECONDS="${PROBE_SETTLE_SECONDS:-5}"
 
 failures=0
 
@@ -38,8 +37,10 @@ via_proxy() { curl --proxy "${PROXY}" --silent --show-error --fail --connect-tim
 # shellcheck disable=SC2016 # $1/$2 expand in the child shell, by design.
 tcp_open() { timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2"; }
 
-# VPC CNI applies policy shortly after the pod starts.
-sleep "${SETTLE_SECONDS}"
+# No settle sleep (dropped, not kept as belt-and-braces): the Job's
+# wait-for-policy init container only lets this container start once direct
+# egress is blocked, so a sleep here would add nothing. In the CONTROL=1 run the
+# init container is removed and there are no policies to wait for.
 
 echo "probe: pod $(hostname), $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
