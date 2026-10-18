@@ -10,6 +10,9 @@ IMAGE_TAG ?= local
 RUNNER_IMAGE ?= factory-runner:$(IMAGE_TAG)
 EGRESS_IMAGE ?= factory-egress:$(IMAGE_TAG)
 
+# Pinned so local and CI runs report the same codes; the runner image's own
+# shellcheck is older and flags SC2317 in trap handlers that 0.11 accepts.
+SHELLCHECK_IMAGE ?= koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
 KUBECONFORM_IMAGE ?= ghcr.io/yannh/kubeconform:v0.7.0@sha256:85dbef6b4b312b99133decc9c6fc9495e9fc5f92293d4ff3b7e1b30f5611823c
 KUBERNETES_VERSION ?= 1.36.0
 CRD_SCHEMAS := https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json
@@ -65,7 +68,7 @@ lint: lint-shell lint-chart ## shellcheck, helm lint and kubeconform (Go lint is
 
 .PHONY: lint-shell
 lint-shell:
-	shellcheck -x -P SCRIPTDIR $(SCRIPTS)
+	docker run --rm -v "$(CURDIR):/mnt:ro" -w /mnt $(SHELLCHECK_IMAGE) -x -P SCRIPTDIR $(SCRIPTS)
 
 .PHONY: lint-chart
 lint-chart:
