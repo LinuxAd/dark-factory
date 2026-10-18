@@ -40,7 +40,7 @@ func TestFetchKey(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeSM{value: tc.value}
-			s := &SecretsManager{Client: f, SecretID: "plat/factory/anthropic-api-key"}
+			s := &Manager{Client: f, SecretID: "plat/factory/anthropic-api-key"}
 			got, err := s.FetchKey(context.Background())
 			if (err != nil) != tc.wantErr || got != tc.want {
 				t.Fatalf("got %q, %v; want %q, err=%v", got, err, tc.want, tc.wantErr)
@@ -56,7 +56,7 @@ func TestFetchKey(t *testing.T) {
 }
 
 func TestFetchKeyAPIError(t *testing.T) {
-	s := &SecretsManager{Client: &fakeSM{err: errors.New("AccessDenied")}, SecretID: "x"}
+	s := &Manager{Client: &fakeSM{err: errors.New("AccessDenied")}, SecretID: "x"}
 	if _, err := s.FetchKey(context.Background()); err == nil {
 		t.Fatal("want error")
 	}

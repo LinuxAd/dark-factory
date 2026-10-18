@@ -23,15 +23,15 @@ type GetSecretValueAPI interface {
 	GetSecretValue(ctx context.Context, in *secretsmanager.GetSecretValueInput, opts ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
 }
 
-// SecretsManager reads the key from one Secrets Manager secret.
-type SecretsManager struct {
+// Manager reads the key from one Secrets Manager secret.
+type Manager struct {
 	Client   GetSecretValueAPI
 	SecretID string
 }
 
-// NewSecretsManager uses the AWS SDK default credential chain, which picks up
+// NewManager uses the AWS SDK default credential chain, which picks up
 // EKS Pod Identity in the cluster.
-func NewSecretsManager(ctx context.Context, secretID string) (*SecretsManager, error) {
+func NewManager(ctx context.Context, secretID string) (*Manager, error) {
 	if secretID == "" {
 		return nil, errors.New("secret id is empty")
 	}
@@ -39,13 +39,13 @@ func NewSecretsManager(ctx context.Context, secretID string) (*SecretsManager, e
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
-	return &SecretsManager{Client: secretsmanager.NewFromConfig(cfg), SecretID: secretID}, nil
+	return &Manager{Client: secretsmanager.NewFromConfig(cfg), SecretID: secretID}, nil
 }
 
 // FetchKey returns the key. `make secrets` stores it as a plain SecretString;
 // it is used as-is apart from trimming surrounding whitespace. Errors never
 // include the secret value.
-func (s *SecretsManager) FetchKey(ctx context.Context) (string, error) {
+func (s *Manager) FetchKey(ctx context.Context) (string, error) {
 	out, err := s.Client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{SecretId: aws.String(s.SecretID)})
 	if err != nil {
 		return "", fmt.Errorf("get secret value %s: %w", s.SecretID, err)
