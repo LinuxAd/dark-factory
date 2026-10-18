@@ -1,0 +1,29 @@
+# Local orchestration state (oh-my-claudecode). Files already committed under
+# it, such as the Phase 0 plan, stay tracked.
+.omc/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+
+# Go
+orchestrator/bin/
+*.test
+coverage.out
+
+# Node
+node_modules/
+
+# Helm
+deploy/chart/charts/
+*.tgz
+
+# Terraform (none in this repo yet)
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Local secrets and scratch output
+.env
+*.env.local

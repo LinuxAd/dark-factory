@@ -1,0 +1,10 @@
+{{/* Identity for sandbox Jobs. It has no Pod Identity association and no
+Kubernetes API token, so a sandbox pod holds no AWS or cluster credential. */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox
+  namespace: {{ .Values.sandboxNamespace }}
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+automountServiceAccountToken: false

@@ -1,0 +1,104 @@
+{{/* Egress proxy for sandbox Jobs (ADR 0001, Decision C1). Sandbox clients
+present no client certificate, so allow_missing_role (a config-file key; there
+is no flag) sends them to the ACL's default rule. Without a default rule every
+request is denied. Smokescreen's built-in deny list already covers private,
+link-local and loopback ranges, so the proxy cannot reach Postgres, the
+gateway or instance metadata. */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smokescreen
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+    app.kubernetes.io/name: smokescreen
+data:
+  config.yaml: |
+    allow_missing_role: true
+  acl.yaml: |
+    version: v1
+    services: []
+    default:
+      name: default
+      project: factory
+      action: enforce
+      allowed_domains:
+      {{- range .Values.smokescreen.allowedDomains }}
+        - {{ . | quote }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smokescreen
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+    app.kubernetes.io/name: smokescreen
+spec:
+  replicas: {{ .Values.smokescreen.replicas }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: smokescreen
+  template:
+    metadata:
+      labels:
+        {{- include "factory.labels" . | nindent 8 }}
+        app.kubernetes.io/name: smokescreen
+      annotations:
+        # Restart on an allowlist change; Smokescreen reads the ACL at start.
+        checksum/acl: {{ toYaml .Values.smokescreen.allowedDomains | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "factory.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: smokescreen
+          image: {{ include "factory.egressImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config-file=/etc/smokescreen/config.yaml
+            - --egress-acl-file=/etc/smokescreen/acl.yaml
+            - --listen-port=4750
+            - --expose-prometheus-metrics
+            - --prometheus-port=9810
+          ports:
+            - name: proxy
+              containerPort: 4750
+            - name: metrics
+              containerPort: 9810
+          readinessProbe:
+            tcpSocket:
+              port: proxy
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: proxy
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.smokescreen.resources | nindent 12 }}
+          securityContext:
+            {{- include "factory.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/smokescreen
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: smokescreen
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smokescreen
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+    app.kubernetes.io/name: smokescreen
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: smokescreen
+  ports:
+    - name: proxy
+      port: 4750
+      targetPort: proxy

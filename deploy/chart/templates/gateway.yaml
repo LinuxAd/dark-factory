@@ -1,0 +1,148 @@
+{{/* The model gateway: the only holder of the Anthropic key. It reads the key
+from Secrets Manager at startup through its own Pod Identity role (SA gateway,
+role factory-gateway in platform-project), so the key is never in a Secret. */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+    app.kubernetes.io/name: gateway
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+    app.kubernetes.io/name: gateway
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  template:
+    metadata:
+      labels:
+        {{- include "factory.labels" . | nindent 8 }}
+        app.kubernetes.io/name: gateway
+    spec:
+      serviceAccountName: gateway
+      # Pod Identity injects its credentials through env and a projected
+      # volume of its own; the Kubernetes API token is not needed.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        {{- include "factory.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ include "factory.gatewayImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: LISTEN_ADDR
+              value: ":8080"
+            - name: METRICS_ADDR
+              value: ":9090"
+            - name: UPSTREAM_URL
+              value: {{ .Values.gateway.upstreamURL | quote }}
+            - name: AWS_REGION
+              value: {{ include "factory.region" . | quote }}
+            - name: ANTHROPIC_KEY_SECRET_ID
+              value: {{ printf "%s/factory/anthropic-api-key" (include "factory.platformName" .) | quote }}
+            # Created by CloudNativePG for the factory owner. Until recovery
+            # creates it the container stays in CreateContainerConfigError,
+            # and kubelet retries without a crash loop.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: factory-db-app
+                  key: uri
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Fails until the key is fetched and migrations have run.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          securityContext:
+            {{- include "factory.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+    app.kubernetes.io/name: gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+{{- if and .Values.gateway.metrics.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gateway
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+    app.kubernetes.io/name: gateway
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.gateway.metrics.interval }}
+{{- end }}
+---
+# Sandbox Jobs read the runner image name from here, so the chart is the one
+# place that derives image names.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: factory-images
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+data:
+  gateway: {{ include "factory.gatewayImage" . | quote }}
+  runner: {{ include "factory.runnerImage" . | quote }}
+  egress: {{ include "factory.egressImage" . | quote }}
