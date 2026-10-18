@@ -60,7 +60,7 @@ while read -r _ mountpoint fstype _; do
   case "${fstype}" in
     proc | sysfs | cgroup | cgroup2 | devpts | mqueue) continue ;;
   esac
-  scan_paths+=("${mountpoint}")
+  [[ " ${scan_paths[*]} " == *" ${mountpoint} "* ]] || scan_paths+=("${mountpoint}")
 done </proc/mounts
 if hits="$(grep -rIls 'sk-ant' "${scan_paths[@]}" 2>/dev/null)" && [[ -n "${hits}" ]]; then
   fail key-in-files "sk-ant found in: ${hits//$'\n'/ }"
