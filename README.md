@@ -65,3 +65,15 @@ make images                      # build the runner and egress images locally
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same checks on every pull request. On `main` it also pushes the gateway, runner and egress images, tagged with the commit SHA.
+
+Pushing on `main` needs four repository variables. A repo created from the platform's service template gets them automatically; this one did not, so set them once from platform-project's baseline outputs:
+
+```sh
+cd ~/repos/platform-project
+gh variable set AWS_ROLE_ARN   -R LinuxAd/dark-factory --body "$(scripts/tf.sh baseline output -raw ci_role_arn)"
+gh variable set AWS_REGION     -R LinuxAd/dark-factory --body <region>
+gh variable set ECR_REGISTRY   -R LinuxAd/dark-factory --body "$(scripts/tf.sh baseline output -raw ecr_registry)"
+gh variable set ECR_REPOSITORY -R LinuxAd/dark-factory --body "$(scripts/tf.sh baseline output -raw ecr_services_prefix)/factory"
+```
+
+`ECR_REPOSITORY` must be `<services prefix>/factory`: the platform's services ApplicationSet deploys `image.repository` from that path, and the runner and egress images are pushed beside it with `-runner` and `-egress` suffixes. Pull requests build the images without pushing and need none of these.

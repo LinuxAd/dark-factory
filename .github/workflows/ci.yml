@@ -87,6 +87,28 @@ jobs:
         with:
           persist-credentials: false
 
+      # This repo was not created from the platform's service template, so
+      # these repository variables are set by hand (see README, CI).
+      - name: Check repository variables
+        if: github.ref == 'refs/heads/main'
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for var in AWS_ROLE_ARN AWS_REGION ECR_REGISTRY ECR_REPOSITORY; do
+            if [[ -z "${!var:-}" ]]; then
+              missing+=("${var}")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error title=Repository variables not set::Missing: ${missing[*]}. See README, CI."
+            exit 1
+          fi
+
       # The CI role trusts only pushes to main, so pull requests get no AWS
       # credentials: they build the image to prove it builds and stop there.
       - name: Configure AWS credentials
@@ -137,7 +159,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: VERSION=${{ github.sha }}
           push: ${{ github.ref == 'refs/heads/main' }}
-          tags: ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}${{ matrix.suffix }}:${{ github.sha }}
+          # Pull requests never push, so they use a local tag that needs no variables.
+          tags: >-
+            ${{ github.ref == 'refs/heads/main'
+              && format('{0}/{1}{2}:{3}', vars.ECR_REGISTRY, vars.ECR_REPOSITORY, matrix.suffix, github.sha)
+              || format('factory{0}:{1}', matrix.suffix, github.sha) }}
           # Only the image index and its two manifests: no attestation
           # manifests, which Karpenter nodes and ECR's lifecycle rules handle
           # less predictably.
