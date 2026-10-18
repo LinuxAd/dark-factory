@@ -6,6 +6,14 @@
 # The per-run Secret holds exactly ANTHROPIC_AUTH_TOKEN, the
 # gateway token minted for this run. Nothing else in the pod is a credential:
 # SA sandbox has no Pod Identity association and no API token.
+#
+# The wait-for-policy init container closes the window between pod start and
+# VPC CNI applying the namespace's NetworkPolicies (security review H3): it
+# polls a direct, unproxied HTTPS call to api.anthropic.com until that call
+# fails, so the runner container only starts once enforcement is live. If
+# egress is still open after 60s it exits 1 and the Job fails. scripts/lib.sh
+# run_job deletes the lines between the begin/end markers when called with
+# WAIT_FOR_POLICY=0 (the CONTROL=1 probe, whose namespace has no policies).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -43,6 +51,40 @@ spec:
         fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
+      # begin wait-for-policy
+      initContainers:
+        - name: wait-for-policy
+          image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              deadline=$((SECONDS + 60))
+              while ((SECONDS < deadline)); do
+                if ! curl --noproxy '*' --silent --output /dev/null -m 2 https://api.anthropic.com; then
+                  echo "wait-for-policy: direct egress to api.anthropic.com is blocked after $((SECONDS))s"
+                  exit 0
+                fi
+                sleep 1
+              done
+              echo "wait-for-policy: direct egress to api.anthropic.com still open after 60s; NetworkPolicies are not enforced"
+              exit 1
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+      # end wait-for-policy
       containers:
         - name: runner
           image: ${IMAGE}

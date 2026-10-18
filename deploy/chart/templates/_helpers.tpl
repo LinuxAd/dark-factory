@@ -1,15 +1,51 @@
-{{/* Required values. Every template that needs one of these includes it, so a
-missing value fails the render instead of deploying a broken store path. */}}
+{{/* Store and secret values. The services ApplicationSet passes only
+image.repository, image.tag and route.host, so platformName, region and the
+account ID are derived from image.repository, which has the form
+<account>.dkr.ecr.<region>.amazonaws.com/<name>/services/<service>. Explicit
+platformName, region or bucket values override the derived ones. Every template
+that needs one of these includes it, so a value that can be neither derived nor
+read fails the render instead of deploying a broken store path. */}}
+{{- define "factory.ecr" -}}
+{{- $repo := .Values.image.repository | default "" -}}
+{{- if regexMatch `^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[^/]+/services/[^/]+$` $repo -}}
+{{- $path := splitList "/" $repo -}}
+{{- $host := splitList "." (index $path 0) -}}
+account: {{ index $host 0 | quote }}
+region: {{ index $host 3 | quote }}
+name: {{ index $path 1 | quote }}
+{{- end -}}
+{{- end -}}
+
 {{- define "factory.platformName" -}}
-{{- required "platformName is required (platform-project var.name)" .Values.platformName -}}
+{{- $ecr := include "factory.ecr" . | fromYaml -}}
+{{- $v := .Values.platformName | default $ecr.name -}}
+{{- if not $v -}}
+{{- fail (printf "cannot derive platformName (platform-project var.name): set it explicitly, or set image.repository to the ECR form <account>.dkr.ecr.<region>.amazonaws.com/<name>/services/factory (got %q)" (.Values.image.repository | default "")) -}}
+{{- end -}}
+{{- $v -}}
 {{- end -}}
 
 {{- define "factory.region" -}}
-{{- required "region is required" .Values.region -}}
+{{- $ecr := include "factory.ecr" . | fromYaml -}}
+{{- $v := .Values.region | default $ecr.region -}}
+{{- if not $v -}}
+{{- fail (printf "cannot derive region: set it explicitly, or set image.repository to the ECR form <account>.dkr.ecr.<region>.amazonaws.com/<name>/services/factory (got %q)" (.Values.image.repository | default "")) -}}
+{{- end -}}
+{{- $v -}}
 {{- end -}}
 
+{{/* Same formula as platform-project terraform/01-baseline/factory.tf:
+${var.name}-factory-state-${account_id}-${var.region}. */}}
 {{- define "factory.bucket" -}}
-{{- required "bucket is required (${platformName}-factory-state-${account_id}-${region})" .Values.bucket -}}
+{{- if .Values.bucket -}}
+{{- .Values.bucket -}}
+{{- else -}}
+{{- $ecr := include "factory.ecr" . | fromYaml -}}
+{{- if not $ecr.account -}}
+{{- fail (printf "cannot derive bucket (<name>-factory-state-<account>-<region>): set it explicitly, or set image.repository to the ECR form <account>.dkr.ecr.<region>.amazonaws.com/<name>/services/factory (got %q)" (.Values.image.repository | default "")) -}}
+{{- end -}}
+{{- printf "%s-factory-state-%s-%s" (include "factory.platformName" .) $ecr.account (include "factory.region" .) -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "factory.labels" -}}

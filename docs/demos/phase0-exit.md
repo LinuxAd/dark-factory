@@ -31,9 +31,11 @@ $ make factory-status
 $ make sandbox-probe; echo "exit=$?"
 <paste the PASS/FAIL report; expect exit=0>
 
-$ make sandbox-probe CONTROL=1; echo "exit=$?"
-<paste; expect FAIL direct-anthropic, among others, and a non-zero exit>
+$ CONTROL=1 scripts/sandbox-probe.sh; echo "exit=$?"
+<paste; expect the "probe: pod" header, FAIL direct-anthropic among others, "control: the probe failed as expected", and exit=1>
 ```
+
+The control runs the script directly because `make` turns every non-zero exit into 2. It exits 1 only when the probe ran and reported `FAIL direct-anthropic`. exit=3 ("inconclusive") means the Job failed for another reason (image pull, scheduling, the probe never ran, or only other checks failed) and does not count for AC4: fix the cause and run it again. exit=0 means the probe passed without NetworkPolicies, which also fails AC4.
 
 ## 3. Smoke call through the gateway (AC6)
 

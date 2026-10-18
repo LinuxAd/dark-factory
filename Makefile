@@ -13,9 +13,20 @@ EGRESS_IMAGE ?= factory-egress:$(IMAGE_TAG)
 KUBECONFORM_IMAGE ?= ghcr.io/yannh/kubeconform:v0.7.0@sha256:85dbef6b4b312b99133decc9c6fc9495e9fc5f92293d4ff3b7e1b30f5611823c
 KUBERNETES_VERSION ?= 1.36.0
 CRD_SCHEMAS := https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json
-# Sample values for rendering the chart locally (Argo CD supplies the real ones).
+# Explicit overrides of the values the chart otherwise derives from
+# image.repository. Argo CD never sets these; this render checks the override path.
 CHART_SAMPLE_VALUES := --namespace factory \
 	--set platformName=platform,region=eu-west-2,bucket=platform-factory-state-111122223333-eu-west-2
+# Exactly the three parameters the platform's services ApplicationSet passes
+# (platform-project gitops/bootstrap/services.yaml). The chart must render from
+# these alone; lint-chart asserts the values it derives.
+CHART_ARGO_VALUES := --namespace factory \
+	--set image.repository=444455556666.dkr.ecr.us-east-1.amazonaws.com/acme/services/factory \
+	--set image.tag=0123456789abcdef0123456789abcdef01234567 \
+	--set route.host=factory.acme.example.com
+KUBECONFORM := docker run --rm -i $(KUBECONFORM_IMAGE) -strict -summary \
+	-kubernetes-version $(KUBERNETES_VERSION) \
+	-schema-location default -schema-location '$(CRD_SCHEMAS)' -
 
 SCRIPTS := $(wildcard scripts/*.sh .claude/hooks/*.sh) runner/probe/probe.sh
 
@@ -36,7 +47,7 @@ smoke: ## Agent SDK call from a sandbox Job through the gateway; prints its agen
 	scripts/smoke.sh
 
 .PHONY: sandbox-probe
-sandbox-probe: ## Isolation probe in a sandbox Job (AC4); CONTROL=1 runs it without NetworkPolicies and must fail
+sandbox-probe: ## Isolation probe in a sandbox Job (AC4); CONTROL=1 is the no-policy control (script exit 1 expected, 3 inconclusive)
 	CONTROL=$(or $(CONTROL),0) scripts/sandbox-probe.sh
 
 .PHONY: verify-row
@@ -59,7 +70,14 @@ lint-shell:
 .PHONY: lint-chart
 lint-chart:
 	helm lint deploy/chart $(CHART_SAMPLE_VALUES)
-	helm template factory deploy/chart $(CHART_SAMPLE_VALUES) --api-versions monitoring.coreos.com/v1 | \
-		docker run --rm -i $(KUBECONFORM_IMAGE) -strict -summary \
-			-kubernetes-version $(KUBERNETES_VERSION) \
-			-schema-location default -schema-location '$(CRD_SCHEMAS)' -
+	helm template factory deploy/chart $(CHART_SAMPLE_VALUES) --api-versions monitoring.coreos.com/v1 | $(KUBECONFORM)
+	helm lint deploy/chart $(CHART_ARGO_VALUES)
+	out="$$(helm template factory deploy/chart $(CHART_ARGO_VALUES) --api-versions monitoring.coreos.com/v1)"; \
+	$(KUBECONFORM) <<<"$$out"; \
+	for want in 's3://acme-factory-state-444455556666-us-east-1/cnpg' \
+		'value: "acme/factory/anthropic-api-key"' 'value: "us-east-1"'; do \
+		grep -qF -- "$$want" <<<"$$out" || { echo "lint-chart: Argo render lacks $$want" >&2; exit 1; }; \
+	done; \
+	echo "lint-chart: Argo-parameter render derives bucket, secret ID and region"
+	@if helm template factory deploy/chart --namespace factory --set image.repository=ghcr.io/acme/factory >/dev/null 2>&1; then \
+		echo "lint-chart: a non-ECR image.repository without overrides must fail the render" >&2; exit 1; fi

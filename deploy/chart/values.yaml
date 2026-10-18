@@ -13,10 +13,12 @@ image:
 route:
   host: ""
 
-# Required, no defaults: the template fails if any is empty. They must match
-# platform-project terraform/01-baseline/factory.tf:
-#   platformName  var.name in platform-project
-#   region        the AWS region
+# Optional overrides. Left empty, all three are derived from image.repository
+# (<account>.dkr.ecr.<region>.amazonaws.com/<name>/services/factory), which is
+# all Argo CD passes; the render fails if a value can be neither derived nor
+# read. The derivation matches platform-project terraform/01-baseline/factory.tf:
+#   platformName  var.name in platform-project (first path segment)
+#   region        the AWS region (from the ECR host)
 #   bucket        ${platformName}-factory-state-${account_id}-${region}
 platformName: ""
 region: ""

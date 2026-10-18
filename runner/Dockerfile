@@ -3,7 +3,8 @@
 # Runner image, Phase 0 smoke subset (plan Step 6): Node.js LTS with the
 # Claude Agent SDK, Go, and curl. It runs as a non-root user with a read-only
 # root filesystem; the Job mounts emptyDirs at /home/runner and /tmp.
-FROM node:24.22.0-trixie-slim
+# node:24.22.0-trixie-slim (multi-arch index digest)
+FROM node:24.22.0-trixie-slim@sha256:7f486cabe892bff8fef04c0f7da8dba84a560be3e4e2740b7a86afc57ebec315
 
 ARG TARGETARCH
 # Pinned with the checksums published at https://go.dev/dl/?mode=json.

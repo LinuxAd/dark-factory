@@ -139,26 +139,46 @@ render() {
 }
 
 # create_token_secret NAMESPACE NAME TOKEN: Secret with exactly
-# ANTHROPIC_AUTH_TOKEN. The token goes through a 0600 temp file, never argv.
+# ANTHROPIC_AUTH_TOKEN. The token reaches kubectl on stdin: printf is a shell
+# builtin, so it is never in any process's argv, and no temp file exists that
+# an INT or TERM could leave behind (the earlier 0600 file needed a trap per
+# signal to be removed reliably). --from-env-file=/dev/stdin was checked with
+# kubectl v1.36 (create --dry-run=client).
 create_token_secret() {
-  local file
-  file="$(umask 077 && mktemp)"
-  printf 'ANTHROPIC_AUTH_TOKEN=%s\n' "$3" >"${file}"
-  if ! kc --namespace "$1" create secret generic "$2" --from-env-file="${file}" >/dev/null; then
-    rm -f "${file}"
+  printf 'ANTHROPIC_AUTH_TOKEN=%s\n' "$3" |
+    kc --namespace "$1" create secret generic "$2" --from-env-file=/dev/stdin >/dev/null ||
     die "cannot create Secret $1/$2"
-  fi
-  rm -f "${file}"
 }
 
-# run_job NAMESPACE JOB_NAME PURPOSE SECRET_NAME COMMAND_JSON: applies the
-# shared sandbox Job, waits for it to finish, prints its logs and returns 0
-# only if it succeeded.
+# revoke_token RUN: revokes every gateway token minted for RUN, for EXIT traps.
+# Best-effort: it logs a failure and always returns 0, so it never masks the
+# calling script's exit status (unrevoked tokens still expire at their TTL).
+revoke_token() {
+  local out
+  if out="$(kf exec deploy/gateway -c gateway -- /gateway revoke-token --run "$1" 2>&1)"; then
+    log "revoked gateway tokens for run $1: ${out//[$'\r\n']/ }"
+  else
+    log "WARNING: gateway revoke-token --run $1 failed; its tokens stay valid until their TTL: ${out//[$'\r\n']/ }"
+  fi
+  return 0
+}
+
+# run_job NAMESPACE JOB_NAME PURPOSE SECRET_NAME COMMAND_JSON [WAIT_FOR_POLICY]:
+# applies the shared sandbox Job, waits for it to finish, prints its logs and
+# returns 0 only if it succeeded. WAIT_FOR_POLICY (default 1) keeps the Job's
+# wait-for-policy init container; 0 removes it, for the CONTROL=1 namespace,
+# which has no NetworkPolicies, so the init container could only time out.
 run_job() {
   # shellcheck disable=SC2034 # read by render through indirect expansion.
   local NAMESPACE="$1" JOB_NAME="$2" PURPOSE="$3" SECRET_NAME="$4" COMMAND="$5" IMAGE
+  local wait_for_policy="${6:-1}"
   IMAGE="$(runner_image)"
   render "${REPO_ROOT}/deploy/sandbox/job.yaml.tmpl" JOB_NAME NAMESPACE IMAGE SECRET_NAME COMMAND PURPOSE |
+    if [[ "${wait_for_policy}" == 0 ]]; then
+      sed '/# begin wait-for-policy/,/# end wait-for-policy/d'
+    else
+      cat
+    fi |
     kc apply -f - >/dev/null
   log "Job ${NAMESPACE}/${JOB_NAME} started (image ${IMAGE})"
 
