@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
@@ -26,6 +27,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver "pgx"
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/database"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -905,25 +909,43 @@ func TestLogsNeverContainKey(t *testing.T) {
 	}
 }
 
-// AC2 (j): two gateways starting at once both come up, migrations ran once.
+// AC2 (j): gateways starting at once all migrate successfully, and each
+// migration is applied once. Every gateway runs store.Migrate on its own
+// pool exactly once, with no retry, released together. The goose version
+// table exists beforehand, as on any database a gateway has started against
+// before; on an empty database goose's own retry around creating that table
+// staggers the callers by a second and would hide a missing lock. Without
+// the advisory lock the callers race to CREATE TABLE and some fail.
 func TestConcurrentStartupMigratesOnce(t *testing.T) {
 	dsn := testpg.New(t)
-	u, _ := url.Parse("http://127.0.0.1:1")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	var wg sync.WaitGroup
-	servers := make([]*Server, 2)
-	errs := make([]error, 2)
-	for i := range servers {
-		servers[i] = New(Config{Upstream: u, Logger: slog.New(slog.DiscardHandler), BackoffBase: 10 * time.Millisecond})
-		wg.Go(func() { errs[i] = servers[i].Init(ctx, secrets.Static(testKey), dsn) })
-	}
-	wg.Wait()
-	for i, s := range servers {
-		if errs[i] != nil || !s.Ready() {
-			t.Fatalf("gateway %d: ready=%v err=%v", i, s.Ready(), errs[i])
+	createGooseVersionTable(t, dsn)
+	const n = 6
+	stores := make([]*store.Store, n)
+	for i := range stores {
+		st, err := store.Open(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
 		}
-		defer s.Close()
+		defer st.Close()
+		stores[i] = st
+	}
+	start := make(chan struct{})
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i, st := range stores {
+		wg.Go(func() {
+			<-start
+			errs[i] = st.Migrate(ctx)
+		})
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("gateway %d: Migrate: %v", i, err)
+		}
 	}
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
@@ -1052,6 +1074,28 @@ func TestCloseDuringInit(t *testing.T) {
 				time.Sleep(20 * time.Millisecond)
 			}
 		})
+	}
+}
+
+// createGooseVersionTable creates goose's version table at version 0 using
+// goose's own Postgres store, so the schema is whatever goose expects.
+func createGooseVersionTable(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	gs, err := database.NewStore(database.DialectPostgres, goose.DefaultTablename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.CreateVersionTable(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.Insert(ctx, db, database.InsertRequest{Version: 0}); err != nil {
+		t.Fatal(err)
 	}
 }
 

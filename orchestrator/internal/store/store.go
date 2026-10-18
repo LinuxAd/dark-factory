@@ -55,7 +55,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("open embedded migrations: %w", err)
 	}
-	locker, err := lock.NewPostgresSessionLocker()
+	// Poll for the lock every second (goose's default is 5s) for the same
+	// 5 minutes in total, so gateways queued behind one another start sooner.
+	locker, err := lock.NewPostgresSessionLocker(lock.WithLockTimeout(1, 300))
 	if err != nil {
 		return fmt.Errorf("create migration lock: %w", err)
 	}
