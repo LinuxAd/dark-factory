@@ -11,6 +11,7 @@
 //	LISTEN_ADDR              proxy, /healthz and /readyz (default :8080)
 //	METRICS_ADDR             /metrics (default :9090)
 //	UPSTREAM_URL             default https://api.anthropic.com
+//	GATEWAY_ALLOW_INSECURE_UPSTREAM  "1" allows an http:// UPSTREAM_URL (tests only)
 //	GATEWAY_MAX_INFLIGHT_PER_TOKEN  concurrent requests per job token (default 8)
 //	AWS_REGION and the rest of the AWS SDK default credential chain
 //
@@ -93,6 +94,12 @@ func gatewayConfig(getenv func(string) string) (gateway.Config, error) {
 	upstream, err := url.Parse(envOr(getenv, "UPSTREAM_URL", "https://api.anthropic.com"))
 	if err != nil || upstream.Scheme == "" || upstream.Host == "" {
 		return cfg, fmt.Errorf("UPSTREAM_URL is not an absolute URL")
+	}
+	// The upstream receives the API key, so plain http is refused unless a
+	// test or local setup opts in explicitly.
+	insecureOK := getenv("GATEWAY_ALLOW_INSECURE_UPSTREAM") == "1"
+	if upstream.Scheme != "https" && (!insecureOK || upstream.Scheme != "http") {
+		return cfg, fmt.Errorf("UPSTREAM_URL must be https (http only with GATEWAY_ALLOW_INSECURE_UPSTREAM=1), got scheme %q", upstream.Scheme)
 	}
 	cfg.Upstream = upstream
 	if v := getenv("GATEWAY_MAX_INFLIGHT_PER_TOKEN"); v != "" {

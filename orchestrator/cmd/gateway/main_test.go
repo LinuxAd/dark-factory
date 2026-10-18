@@ -188,3 +188,23 @@ func TestRevokeToken(t *testing.T) {
 		t.Errorf("without --run: exit %d stdout %q, want non-zero and empty", code, out.String())
 	}
 }
+
+func TestUpstreamMustBeHTTPS(t *testing.T) {
+	envOf := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	if cfg, err := gatewayConfig(envOf(nil)); err != nil || cfg.Upstream.String() != "https://api.anthropic.com" {
+		t.Errorf("default: %v, %v", cfg.Upstream, err)
+	}
+	for _, insecure := range []string{"", "0", "true", "yes"} {
+		_, err := gatewayConfig(envOf(map[string]string{"UPSTREAM_URL": "http://fake:8080", "GATEWAY_ALLOW_INSECURE_UPSTREAM": insecure}))
+		if err == nil || !strings.Contains(err.Error(), "https") {
+			t.Errorf("http upstream with GATEWAY_ALLOW_INSECURE_UPSTREAM=%q: err %v, want refusal", insecure, err)
+		}
+	}
+	cfg, err := gatewayConfig(envOf(map[string]string{"UPSTREAM_URL": "http://fake:8080", "GATEWAY_ALLOW_INSECURE_UPSTREAM": "1"}))
+	if err != nil || cfg.Upstream.String() != "http://fake:8080" {
+		t.Errorf("opt-in http upstream: %v, %v", cfg.Upstream, err)
+	}
+	if _, err := gatewayConfig(envOf(map[string]string{"UPSTREAM_URL": "ftp://x", "GATEWAY_ALLOW_INSECURE_UPSTREAM": "1"})); err == nil {
+		t.Error("ftp upstream accepted")
+	}
+}

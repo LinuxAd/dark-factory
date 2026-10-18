@@ -54,7 +54,8 @@ Desktop.
 | `DATABASE_URL` | Postgres DSN (empty: libpq `PG*` variables) |
 | `LISTEN_ADDR` | `:8080`: proxy plus `GET /healthz` (always 200) and `GET /readyz` (200 after key fetch and migrations); probes need no token |
 | `METRICS_ADDR` | `:9090`: `GET /metrics` |
-| `UPSTREAM_URL` | `https://api.anthropic.com` |
+| `UPSTREAM_URL` | `https://api.anthropic.com`; must be `https` (startup fails otherwise) |
+| `GATEWAY_ALLOW_INSECURE_UPSTREAM` | unset; `1` allows an `http://` `UPSTREAM_URL`, for local fakes only |
 | `GATEWAY_MAX_INFLIGHT_PER_TOKEN` | `8`: concurrent requests per job token; more get 429 `rate_limit_error` with no upstream call |
 | `AWS_REGION` | for the AWS SDK; credentials come from EKS Pod Identity |
 
