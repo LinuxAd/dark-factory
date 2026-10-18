@@ -80,7 +80,9 @@ A Cluster that is healthy but fails its backup aborts teardown, and teardown pri
 | Smokescreen | 443 and 80 anywhere; Smokescreen enforces the allowlist itself. Ingress from `factory-sandbox` |
 | CNPG pods (`cnpg.io/cluster In (factory-db, factory-db-seed)`, which also covers the recovery and initdb Job pods) | 443 anywhere; the Pod Identity agent. Ingress 5432 from the gateway, 8000/5432 from `cnpg-system`, 9187 from `monitoring` |
 
-Sandbox Jobs start with a `wait-for-policy` init container. It polls a direct, unproxied HTTPS call to `api.anthropic.com` for up to 60s and lets the runner container start only once that call fails, so the runner never runs in the window before VPC CNI applies the policies (security review H3). The `CONTROL=1` probe, which runs in a namespace with no policies, leaves the init container out so that the probe itself shows the open egress.
+Sandbox Jobs start with a `wait-for-policy` init container, so the runner never runs in the window before VPC CNI applies the policies (security review H3). It first needs a positive control: an unproxied GET of the gateway's `/healthz` must succeed, which proves the pod network is up and the gateway allow rule is live. It then probes `https://1.1.1.1/` directly, an IP so that DNS cannot be what fails, and counts only curl exit 28 (a connect timeout, because the policy drops packets) as blocked. Three consecutive 28s let the runner start; any other result resets the count, and after 60s the Job fails. The first version treated any failed call to `api.anthropic.com` as enforcement, so a DNS or pod-network failure passed it; the re-review (R1) asked for this stronger check. The `CONTROL=1` probe, which runs in a namespace with no policies, leaves the init container out so that the probe itself shows the open egress.
+
+The `services` ApplicationSet in platform-project now enforces the AppProject allowlist (security review R2): a registration can select only `services` or a project defined in the platform-projects chart, and anything else falls back to `services`. platform-project ADR 0015 records it.
 
 ## Step 0a outcomes
 
@@ -100,6 +102,12 @@ Still to check on the live cluster:
 - kubelet liveness and readiness probes reach the gateway under default-deny ingress with VPC CNI (kubelet traffic comes from the node, which no ingress rule names);
 - the factory-db role's `s3:ListBucket` works for the plugin's HeadBucket and list calls;
 - one admission test under `restricted`.
+- how soon after `make up` the Barman plugin populates `ObjectStore.status.serverRecoveryWindow`, which the teardown pre-backup step (1b) reads;
+- whether Argo CD matches the `factory` AppProject's `sourceRepos` (built from `githubOwner`) against the registration's `repoURL` with the right case, given the owner `LinuxAd` is mixed-case.
+
+## Outstanding before AC2 sign-off
+
+- **Step 0b real fixtures.** The usage fixtures in `orchestrator/internal/usage/testdata/` are synthetic, written from the documented API format, because no key was available when the gateway was built. AC2 replays Step 0b fixtures, so it is not signed off until Adam captures real responses with his own key, following [`orchestrator/internal/usage/testdata/README.md`](../../orchestrator/internal/usage/testdata/README.md). The token values asserted in the usage and gateway tests come from these files, so their expectations change in the same commit, and the commit message says the spec changed (real data replaced synthetic), per CLAUDE.md. `stream_error.sse` stays synthetic.
 
 ## Consequences
 

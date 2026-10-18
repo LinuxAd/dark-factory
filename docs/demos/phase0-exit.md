@@ -1,6 +1,6 @@
 # Phase 0 exit demo
 
-This file records AC4 and AC6 to AC8 from `.omc/plans/ralplan-phase0-foundations.md` as shown on the real cluster. Replace each `<paste …>` with the command's real output, unedited apart from redacting account IDs if you want to.
+This file records AC4 and AC6 to AC8 from `.omc/plans/ralplan-phase0-foundations.md` as shown on the real cluster, plus the Step 0b fixture capture that AC2 sign-off needs (section 6). Replace each `<paste …>` with the command's real output, unedited apart from redacting account IDs if you want to.
 
 **Exit criterion (SPEC.md §9):** a sandbox Job calls Claude through the gateway with no key in the pod, the call appears in `agent_calls`, and the row is still there after `make down` then `make up`.
 
@@ -27,9 +27,11 @@ $ make factory-status
 
 ## 2. Isolation (AC4)
 
+AC4 passes when `make sandbox-probe` exits 0 and `CONTROL=1 scripts/sandbox-probe.sh` exits 1.
+
 ```console
 $ make sandbox-probe; echo "exit=$?"
-<paste the PASS/FAIL report; expect exit=0>
+<paste the PASS/FAIL report, with the wait-for-policy line "gateway reachable and direct egress to 1.1.1.1 dropped 3 times in a row"; expect exit=0>
 
 $ CONTROL=1 scripts/sandbox-probe.sh; echo "exit=$?"
 <paste; expect the "probe: pod" header, FAIL direct-anthropic among others, "control: the probe failed as expected", and exit=1>
@@ -89,6 +91,22 @@ $ aws s3api get-bucket-lifecycle-configuration --bucket <bucket>
 $ kubectl --context "$FACTORY_KUBE_CONTEXT" -n factory get backups
 <paste; the pre-teardown backup from step 1b is listed as completed>
 ```
+
+## 6. Real usage fixtures (Step 0b, AC2)
+
+AC2 is not signed off while `orchestrator/internal/usage/testdata/` holds the synthetic fixtures. From your own shell, with the key only in the environment:
+
+- [ ] Capture `message.json`, `stream.sse` and `stream_server_tool.sse` with the commands in `orchestrator/internal/usage/testdata/README.md`. Keep `stream_error.sse` synthetic.
+- [ ] Review each file: no key, no personal content.
+- [ ] Update the token expectations in the usage and gateway tests in the same commit, and say in the commit message that the spec changed (real data replaced synthetic), per CLAUDE.md.
+- [ ] `make -C orchestrator test lint` passes.
+
+Fixture commit: `<sha>`
+
+## Open questions to answer on the live cluster
+
+- How long after `make up` does the Barman plugin populate `ObjectStore.status.serverRecoveryWindow`? Teardown step 1b reads it. `<seconds, or "not populated" and what was done>`
+- Does Argo CD match the `factory` AppProject's `sourceRepos` against the registration's `repoURL` with the right case (`LinuxAd`)? `<yes/no; evidence: svc-factory synced, or the error>`
 
 ## Notes
 
