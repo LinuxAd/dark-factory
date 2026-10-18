@@ -1,0 +1,82 @@
+{{/* CloudNativePG cluster backed up by the Barman Cloud plugin to the baseline
+bucket. Shapes follow docs/research/phase0-spikes.md. The Cluster always
+bootstraps by recovery: the first-ever bring-up is `make db-init`, which seeds
+the store from factory-db-seed (ADR 0001, Decision B-i). CloudNativePG names
+the instance ServiceAccount after the Cluster, so the pods run as SA factory-db,
+which platform-project binds to the factory-db Pod Identity role. */}}
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: factory-db-store
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+spec:
+  retentionPolicy: {{ .Values.postgres.retentionPolicy | quote }}
+  configuration:
+    destinationPath: {{ printf "s3://%s/cnpg" (include "factory.bucket" .) | quote }}
+    s3Credentials:
+      inheritFromIAMRole: true
+    wal:
+      compression: gzip
+      maxParallel: 2
+  instanceSidecarConfiguration:
+    env:
+      # Pod Identity injects no region.
+      - name: AWS_REGION
+        value: {{ include "factory.region" . | quote }}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: factory-db
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+    # platform-project scripts/teardown.sh takes a backup of every Cluster with
+    # this label before make down (ADR 0001, Decision G1).
+    platform/backup-before-teardown: "true"
+  annotations:
+    # Recovery into the same serverName would otherwise refuse to archive into
+    # a non-empty WAL path. Safe only with one writer (ADR 0001, risk R2).
+    cnpg.io/skipEmptyWalArchiveCheck: "enabled"
+spec:
+  # One instance in Phase 0. Raising it needs a NetworkPolicy rule for
+  # 5432/8000 between CNPG pods.
+  instances: 1
+  imageName: {{ .Values.postgres.imageName | quote }}
+  storage:
+    size: {{ .Values.postgres.storageSize }}
+  resources:
+    {{- toYaml .Values.postgres.resources | nindent 4 }}
+  bootstrap:
+    recovery:
+      source: origin
+      database: factory
+      owner: factory
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: factory-db-store
+        serverName: factory-db
+  externalClusters:
+    - name: origin
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters:
+          barmanObjectName: factory-db-store
+          serverName: factory-db
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: factory-db-nightly
+  labels:
+    {{- include "factory.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.postgres.backupSchedule | quote }}
+  backupOwnerReference: self
+  cluster:
+    name: factory-db
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io

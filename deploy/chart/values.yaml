@@ -1,0 +1,82 @@
+# The platform's services ApplicationSet sets image.repository, image.tag and
+# route.host (gitops/bootstrap/services.yaml in platform-project). The defaults
+# below exist only so `helm template` works locally; Argo CD always overrides
+# them. The runner and egress images are derived from image.repository by
+# appending -runner and -egress, at the same tag.
+image:
+  repository: 111122223333.dkr.ecr.eu-west-2.amazonaws.com/platform/services/factory
+  tag: local
+  pullPolicy: IfNotPresent
+
+# Injected by the ApplicationSet. The factory exposes nothing through the
+# shared gateway in Phase 0, so it is accepted and unused.
+route:
+  host: ""
+
+# Optional overrides. Left empty, all three are derived from image.repository
+# (<account>.dkr.ecr.<region>.amazonaws.com/<name>/services/factory), which is
+# all Argo CD passes; the render fails if a value can be neither derived nor
+# read. The derivation matches platform-project terraform/01-baseline/factory.tf:
+#   platformName  var.name in platform-project (first path segment)
+#   region        the AWS region (from the ECR host)
+#   bucket        ${platformName}-factory-state-${account_id}-${region}
+platformName: ""
+region: ""
+bucket: ""
+
+# Namespace that sandbox Jobs run in (created by this chart).
+sandboxNamespace: factory-sandbox
+
+# Namespaces whose pods may reach the factory (NetworkPolicy namespaceSelector,
+# by kubernetes.io/metadata.name).
+monitoringNamespace: monitoring
+cnpgNamespace: cnpg-system
+
+# Set when the cluster is dual-stack so the Pod Identity agent's IPv6 address
+# is also allowed.
+dualStack: false
+
+gateway:
+  replicas: 1
+  upstreamURL: https://api.anthropic.com
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  metrics:
+    enabled: true
+    interval: 30s
+
+postgres:
+  # Pinned so recovery always runs the same major version the backup was
+  # taken with. make db-init copies this into the seed Cluster.
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie
+  storageSize: 5Gi
+  retentionPolicy: "30d"
+  # Six fields, seconds first.
+  backupSchedule: "0 0 2 * * *"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+smokescreen:
+  replicas: 1
+  # SPEC.md section 7.2.
+  allowedDomains:
+    - proxy.golang.org
+    - sum.golang.org
+    - registry.npmjs.org
+    - github.com
+    - api.github.com
+    - "*.githubusercontent.com"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi

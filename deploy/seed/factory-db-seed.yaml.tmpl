@@ -1,0 +1,34 @@
+# Seed Cluster for the first-ever bring-up (plan Step 8, `make db-init`).
+# Applied and deleted by scripts/factory-db-init.sh; never synced by Argo CD.
+#
+# It initialises an empty database with the same database and owner as the
+# chart's recovery bootstrap, archives into the chart's ObjectStore under the
+# chart's serverName, and takes one base backup. The chart's Cluster factory-db
+# then recovers from that backup. CloudNativePG names the instance
+# ServiceAccount factory-db-seed, which platform-project binds to the factory-db
+# Pod Identity role.
+#
+# The image name is copied from the live factory-db Cluster so the backup and the
+# recovery run the same Postgres major version.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: factory-db-seed
+  namespace: factory
+  labels:
+    app.kubernetes.io/part-of: factory
+spec:
+  instances: 1
+  imageName: ${IMAGE_NAME}
+  storage:
+    size: 1Gi
+  bootstrap:
+    initdb:
+      database: factory
+      owner: factory
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: factory-db-store
+        serverName: factory-db

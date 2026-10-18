@@ -1,0 +1,172 @@
+# Lint and test on every pull request and push. On main, also build and push
+# the three factory images, tagged with the commit SHA, which Argo CD uses as
+# image.tag (platform-project docs/adr/0009-service-delivery.md):
+#
+#   ${ECR_REPOSITORY}         gateway   (orchestrator/Dockerfile)
+#   ${ECR_REPOSITORY}-runner  runner    (runner/Dockerfile)
+#   ${ECR_REPOSITORY}-egress  egress    (runner/egress.Dockerfile)
+#
+# The chart derives the runner and egress names the same way. Repository
+# variables AWS_ROLE_ARN, AWS_REGION, ECR_REGISTRY and ECR_REPOSITORY follow
+# the Backstage service template (ECR_REPOSITORY = <platform>/services/factory).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Never cancel a run on main: it may be half way through pushing an image.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  go:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # golangci-lint and the Go toolchain run in the Docker images pinned in
+      # orchestrator/Makefile; integration tests start their own Postgres.
+      - name: Lint
+        run: make -C orchestrator lint
+
+      - name: Test
+        run: make -C orchestrator test
+
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.1
+
+      # shellcheck, helm lint, and kubeconform (in Docker) on the rendered chart.
+      - name: Lint scripts and chart
+        run: make lint
+
+  image:
+    needs: [go, deploy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the AWS role
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gateway
+            suffix: ""
+            context: .
+            dockerfile: orchestrator/Dockerfile
+          - name: runner
+            suffix: -runner
+            context: runner
+            dockerfile: runner/Dockerfile
+          - name: egress
+            suffix: -egress
+            context: runner
+            dockerfile: runner/egress.Dockerfile
+    name: image (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # This repo was not created from the platform's service template, so
+      # these repository variables are set by hand (see README, CI).
+      - name: Check repository variables
+        if: github.ref == 'refs/heads/main'
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for var in AWS_ROLE_ARN AWS_REGION ECR_REGISTRY ECR_REPOSITORY; do
+            if [[ -z "${!var:-}" ]]; then
+              missing+=("${var}")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error title=Repository variables not set::Missing: ${missing[*]}. See README, CI."
+            exit 1
+          fi
+
+      # The CI role trusts only pushes to main, so pull requests get no AWS
+      # credentials: they build the image to prove it builds and stop there.
+      - name: Configure AWS credentials
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      # ECR tags are immutable, so pushing the same commit twice would fail.
+      # Skipping makes re-running a workflow harmless. A repository that does
+      # not exist yet is created by the first push.
+      - name: Check whether the image already exists
+        id: exists
+        if: github.ref == 'refs/heads/main'
+        env:
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}${{ matrix.suffix }}
+        run: |
+          if out="$(aws ecr describe-images --repository-name "${ECR_REPOSITORY}" \
+            --image-ids "imageTag=${GITHUB_SHA}" 2>&1)"; then
+            echo "The image for ${GITHUB_SHA} is already in ECR; not pushing again."
+            echo "push=false" >> "${GITHUB_OUTPUT}"
+          elif grep -qE 'ImageNotFoundException|RepositoryNotFoundException' <<<"${out}"; then
+            echo "push=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "${out}" >&2
+            exit 1
+          fi
+
+      # The gateway and egress builds cross-compile Go on the runner; the
+      # runner image installs packages for the target architecture, so it needs
+      # emulation for arm64.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: matrix.name == 'runner'
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the image, and push it on main
+        if: github.ref != 'refs/heads/main' || steps.exists.outputs.push == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ github.sha }}
+          push: ${{ github.ref == 'refs/heads/main' }}
+          # Pull requests never push, so they use a local tag that needs no variables.
+          tags: >-
+            ${{ github.ref == 'refs/heads/main'
+              && format('{0}/{1}{2}:{3}', vars.ECR_REGISTRY, vars.ECR_REPOSITORY, matrix.suffix, github.sha)
+              || format('factory{0}:{1}', matrix.suffix, github.sha) }}
+          # Only the image index and its two manifests: no attestation
+          # manifests, which Karpenter nodes and ECR's lifecycle rules handle
+          # less predictably.
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
