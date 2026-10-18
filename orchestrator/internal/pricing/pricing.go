@@ -43,7 +43,7 @@ type modelPrice struct {
 const webSearchPerRequest = 10_000_000 // $10 per 1,000 requests
 
 var prices = map[string]modelPrice{
-	"claude-opus-5-5": {base: rates{input: 4000, output: 20000, cacheWrite5m: 5000, cacheWrite1h: 8000, cacheRead: 200}},
+	"claude-opus-5-5":   {base: rates{input: 4000, output: 20000, cacheWrite5m: 5000, cacheWrite1h: 8000, cacheRead: 200}},
 	"claude-sonnet-5-5": {base: rates{input: 2000, output: 10000, cacheWrite5m: 2500, cacheWrite1h: 4000, cacheRead: 200}},
 	"claude-haiku-5-5": {
 		base:           rates{input: 100, output: 500, cacheWrite5m: 125, cacheWrite1h: 200, cacheRead: 10},

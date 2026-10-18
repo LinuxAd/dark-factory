@@ -11,9 +11,9 @@ import (
 )
 
 type fakeSM struct {
-	value  *string
-	err    error
-	gotID  string
+	value *string
+	err   error
+	gotID string
 }
 
 func (f *fakeSM) GetSecretValue(_ context.Context, in *secretsmanager.GetSecretValueInput, _ ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
