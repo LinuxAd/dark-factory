@@ -4,7 +4,6 @@ package secrets
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -43,8 +42,9 @@ func NewSecretsManager(ctx context.Context, secretID string) (*SecretsManager, e
 	return &SecretsManager{Client: secretsmanager.NewFromConfig(cfg), SecretID: secretID}, nil
 }
 
-// FetchKey returns the key. The secret may be the bare key, or a JSON object
-// with an "api_key" field. Errors never include the secret value.
+// FetchKey returns the key. `make secrets` stores it as a plain SecretString;
+// it is used as-is apart from trimming surrounding whitespace. Errors never
+// include the secret value.
 func (s *SecretsManager) FetchKey(ctx context.Context) (string, error) {
 	out, err := s.Client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{SecretId: aws.String(s.SecretID)})
 	if err != nil {
@@ -58,15 +58,6 @@ func (s *SecretsManager) FetchKey(ctx context.Context) (string, error) {
 
 func parseKey(v string) (string, error) {
 	v = strings.TrimSpace(v)
-	if strings.HasPrefix(v, "{") {
-		var obj struct {
-			APIKey string `json:"api_key"`
-		}
-		if json.Unmarshal([]byte(v), &obj) != nil {
-			return "", errors.New("secret is a malformed JSON object")
-		}
-		v = strings.TrimSpace(obj.APIKey)
-	}
 	if v == "" {
 		return "", errors.New("secret holds an empty key")
 	}

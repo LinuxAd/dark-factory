@@ -31,10 +31,9 @@ func TestFetchKey(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"bare", aws.String("sk-ant-test\n"), "sk-ant-test", false},
-		{"json", aws.String(`{"api_key":"sk-ant-json"}`), "sk-ant-json", false},
-		{"json missing field", aws.String(`{"other":"x"}`), "", true},
-		{"malformed json", aws.String(`{"api_key":`), "", true},
+		{"plain", aws.String("sk-ant-test"), "sk-ant-test", false},
+		{"surrounding whitespace trimmed", aws.String(" \tsk-ant-test\r\n"), "sk-ant-test", false},
+		{"no JSON unwrapping", aws.String(`{"api_key":"sk-ant-json"}`), `{"api_key":"sk-ant-json"}`, false},
 		{"empty", aws.String("  "), "", true},
 		{"binary only", nil, "", true},
 	}
