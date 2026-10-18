@@ -58,7 +58,10 @@ Desktop.
 | `AWS_REGION` | for the AWS SDK; credentials come from EKS Pod Identity |
 
 Callers send `Authorization: Bearer <token>` (what the Agent SDK sends for
-`ANTHROPIC_AUTH_TOKEN`). Any path is forwarded for a valid token; only
+`ANTHROPIC_AUTH_TOKEN`). Only `POST /v1/messages`,
+`POST /v1/messages/count_tokens`, `GET /v1/models` and `GET /v1/models/{id}`
+are forwarded; any other method or path (Batches, Files, a trailing slash, an
+escaped path) gets 404 `not_found_error` with no upstream call. Only
 `POST /v1/messages` writes an `agent_calls` row.
 
 Mint a job token (prints only the token on stdout):

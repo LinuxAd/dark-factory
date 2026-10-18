@@ -151,21 +151,69 @@ func retry[T any](ctx context.Context, s *Server, what string, f func(context.Co
 	}
 }
 
-// Handler serves /healthz, /readyz and the proxy.
+// Handler serves /healthz, /readyz and the proxy. It dispatches on the raw
+// request path rather than through http.ServeMux, which would clean paths
+// and redirect, so the allowlist sees exactly what the client sent.
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if !s.Ready() {
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
-			return
+	proxy := s.instrument(http.HandlerFunc(s.serveProxy))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/healthz" && r.URL.RawPath == "":
+			_, _ = w.Write([]byte("ok\n"))
+		case r.Method == http.MethodGet && r.URL.Path == "/readyz" && r.URL.RawPath == "":
+			if !s.Ready() {
+				http.Error(w, "not ready", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte("ready\n"))
+		default:
+			proxy.ServeHTTP(w, r)
 		}
-		_, _ = w.Write([]byte("ready\n"))
 	})
-	mux.Handle("/", s.instrument(http.HandlerFunc(s.serveProxy)))
-	return mux
+}
+
+// route reports whether a request is on the forwarding allowlist (Decision
+// D) and whether it is metered. Batches, Files and every other endpoint are
+// refused: they would be unmetered and act workspace-wide. Escaped paths
+// (non-empty RawPath) are refused outright so no encoding can smuggle a
+// different path past the comparison.
+func route(r *http.Request) (allowed, metered bool) {
+	if r.URL.RawPath != "" {
+		return false, false
+	}
+	p := r.URL.Path
+	switch r.Method {
+	case http.MethodPost:
+		switch p {
+		case "/v1/messages":
+			return true, true
+		case "/v1/messages/count_tokens":
+			return true, false
+		}
+	case http.MethodGet:
+		if p == "/v1/models" {
+			return true, false
+		}
+		if id, ok := strings.CutPrefix(p, "/v1/models/"); ok && validModelID(id) {
+			return true, false
+		}
+	}
+	return false, false
+}
+
+// validModelID accepts one path segment of letters, digits, '.', '_' and
+// '-' that is not "." or "..".
+func validModelID(id string) bool {
+	if id == "" || id == "." || id == ".." {
+		return false
+	}
+	for _, c := range id {
+		ok := c == '.' || c == '_' || c == '-' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // reqInfo is filled in while a request is served and read by instrument.
@@ -186,6 +234,11 @@ func info(r *http.Request) *reqInfo {
 
 func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request) {
 	ri := info(r)
+	allowed, metered := route(r)
+	if !allowed {
+		writeError(w, http.StatusNotFound, "not_found_error", "not found")
+		return
+	}
 	if !s.Ready() {
 		writeError(w, http.StatusServiceUnavailable, "api_error", "gateway is starting")
 		return
@@ -220,7 +273,7 @@ func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ri.proxied = true
-	ri.metered = r.Method == http.MethodPost && r.URL.Path == "/v1/messages"
+	ri.metered = metered
 	s.proxy.ServeHTTP(w, r)
 }
 

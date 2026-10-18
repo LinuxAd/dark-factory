@@ -569,6 +569,76 @@ func TestNonMessagesPathsPassThroughWithoutRow(t *testing.T) {
 	}
 }
 
+// do sends a bodyless request with a bearer token. rawURL is appended to the
+// gateway URL unparsed, so escaped paths reach the server as written.
+func do(t *testing.T, e *env, method, rawURL, tok string) (*http.Response, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(method, e.front.URL+rawURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	return resp, body
+}
+
+// Only the four allowlisted routes are forwarded; Batches, Files and any
+// other path or method get 404 with no upstream call and no row.
+func TestPathAllowlist(t *testing.T) {
+	e := newEnv(t, serveFixture(t, "message.json"))
+	tok := e.token(t, store.Token{RunID: "run-allow", Stage: "build"})
+	denied := []struct{ method, url string }{
+		{"POST", "/v1/messages/batches"},
+		{"GET", "/v1/messages/batches"},
+		{"GET", "/v1/files"},
+		{"POST", "/v1/files"},
+		{"POST", "/v1/messages/"},
+		{"POST", "/v1//messages"},
+		{"POST", "/v1/messages/count_tokens/"},
+		{"GET", "/v1/models/"},
+		{"GET", "/v1/models/a/b"},
+		{"GET", "/v1/models/.."},
+		{"GET", "/v1/models/claude%2Dopus-5-5"}, // non-empty RawPath
+		{"GET", "/v1/models/a%2Fb"},
+		{"GET", "/v1/messages"},
+		{"POST", "/v1/models"},
+		{"DELETE", "/v1/models/claude-opus-5-5"},
+		{"GET", "/v1/organizations/me"},
+		{"GET", "/"},
+	}
+	for _, c := range denied {
+		resp, body := do(t, e, c.method, c.url, tok)
+		if resp.StatusCode != http.StatusNotFound || !bytes.Contains(body, []byte(`"not_found_error"`)) {
+			t.Errorf("%s %s: status %d body %s, want 404 not_found_error", c.method, c.url, resp.StatusCode, body)
+		}
+	}
+	if n := len(e.up.requests()); n != 0 {
+		t.Errorf("upstream received %d requests for denied paths, want 0", n)
+	}
+	if rows := e.rows(t, "run-allow"); len(rows) != 0 {
+		t.Errorf("got %d rows for denied paths", len(rows))
+	}
+	for _, c := range []struct{ method, url string }{
+		{"GET", "/v1/models"},
+		{"GET", "/v1/models/claude-opus-5-5"},
+		{"POST", "/v1/messages/count_tokens"},
+	} {
+		if resp, _ := do(t, e, c.method, c.url, tok); resp.StatusCode != 200 {
+			t.Errorf("%s %s: status %d, want 200", c.method, c.url, resp.StatusCode)
+		}
+	}
+	if n := len(e.up.requests()); n != 3 {
+		t.Errorf("upstream received %d requests for allowed paths, want 3", n)
+	}
+}
+
 // AC2 (i): captured logs never contain the configured key (or job tokens).
 func TestLogsNeverContainKey(t *testing.T) {
 	var mode atomic.Value
