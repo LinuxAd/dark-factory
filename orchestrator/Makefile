@@ -1,8 +1,11 @@
 # Go tooling runs only in pinned Docker images; nothing is installed on the
-# host. Bump an image here and every target follows.
-GO_IMAGE   := golang:1.27.2
-LINT_IMAGE := golangci/golangci-lint:v2.14.0
-PG_IMAGE   := postgres:18.6
+# host. Bump an image here and every target follows. Each is pinned by its
+# multi-arch index digest (docker buildx imagetools inspect); the tag before
+# the @ is for readers, Docker pulls by the digest. GO_IMAGE matches the
+# build stage in Dockerfile.
+GO_IMAGE   := golang:1.27.2@sha256:820153096fda4de6ac1b7194d12e416b7dd8f4e9a33d17e0345b111b945162d8
+LINT_IMAGE := golangci/golangci-lint:v2.14.0@sha256:ad862ba6b3798cbe0fd9fd7408d498fd74fbd2623a92406b2fd3898faf0bf98f
+PG_IMAGE   := postgres:18.6@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
 
 # The repo root is mounted so the ../memory module (replace directive) is visible.
 REPO_ROOT := $(abspath $(CURDIR)/..)
