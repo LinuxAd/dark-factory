@@ -55,6 +55,7 @@ Desktop.
 | `LISTEN_ADDR` | `:8080`: proxy plus `GET /healthz` (always 200) and `GET /readyz` (200 after key fetch and migrations); probes need no token |
 | `METRICS_ADDR` | `:9090`: `GET /metrics` |
 | `UPSTREAM_URL` | `https://api.anthropic.com` |
+| `GATEWAY_MAX_INFLIGHT_PER_TOKEN` | `8`: concurrent requests per job token; more get 429 `rate_limit_error` with no upstream call |
 | `AWS_REGION` | for the AWS SDK; credentials come from EKS Pod Identity |
 
 Callers send `Authorization: Bearer <token>` (what the Agent SDK sends for
@@ -63,6 +64,11 @@ Callers send `Authorization: Bearer <token>` (what the Agent SDK sends for
 are forwarded; any other method or path (Batches, Files, a trailing slash, an
 escaped path) gets 404 `not_found_error` with no upstream call. Only
 `POST /v1/messages` writes an `agent_calls` row.
+
+Limits: request headers 64 KiB (431 above), idle keep-alive 90 s, header
+read 10 s, request body 32 MiB (413 `request_too_large` above, no row). An
+unknown token is remembered for 30 s (at most 10,000 entries) so repeated
+bad tokens get 401 without a database lookup.
 
 Mint a job token (prints only the token on stdout):
 

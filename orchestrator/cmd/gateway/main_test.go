@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -74,5 +76,45 @@ func TestUnknownCommand(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if code := run(context.Background(), []string{"nope"}, func(string) string { return "" }, &out, &errOut); code != 2 {
 		t.Fatalf("exit %d, want 2", code)
+	}
+}
+
+func TestHTTPServerLimits(t *testing.T) {
+	srv := newHTTPServer("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	if srv.IdleTimeout != 90*time.Second || srv.MaxHeaderBytes != 64<<10 || srv.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("IdleTimeout %v MaxHeaderBytes %d ReadHeaderTimeout %v", srv.IdleTimeout, srv.MaxHeaderBytes, srv.ReadHeaderTimeout)
+	}
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+	req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
+	req.Header.Set("X-Big", strings.Repeat("a", 80<<10))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Errorf("80 KiB header: status %d, want 431", resp.StatusCode)
+	}
+}
+
+func TestGatewayConfigFromEnv(t *testing.T) {
+	envOf := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	cfg, err := gatewayConfig(envOf(map[string]string{"GATEWAY_MAX_INFLIGHT_PER_TOKEN": "3"}))
+	if err != nil || cfg.MaxInflightPerToken != 3 {
+		t.Errorf("GATEWAY_MAX_INFLIGHT_PER_TOKEN=3: got %d, %v", cfg.MaxInflightPerToken, err)
+	}
+	if cfg, err = gatewayConfig(envOf(nil)); err != nil || cfg.MaxInflightPerToken != 0 {
+		t.Errorf("unset: got %d, %v; want 0 (gateway default)", cfg.MaxInflightPerToken, err)
+	}
+	for _, bad := range []string{"0", "-1", "eight"} {
+		if _, err := gatewayConfig(envOf(map[string]string{"GATEWAY_MAX_INFLIGHT_PER_TOKEN": bad})); err == nil ||
+			!strings.Contains(err.Error(), "GATEWAY_MAX_INFLIGHT_PER_TOKEN") {
+			t.Errorf("GATEWAY_MAX_INFLIGHT_PER_TOKEN=%q: err %v, want one naming the variable", bad, err)
+		}
 	}
 }

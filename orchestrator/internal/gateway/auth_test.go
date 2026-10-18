@@ -102,3 +102,23 @@ func TestBackoffCappedAt30s(t *testing.T) {
 		t.Errorf("large attempt: got %v", got)
 	}
 }
+
+func TestNegCacheBoundedAndExpires(t *testing.T) {
+	c := newNegCache(time.Minute, 3)
+	t0 := time.Unix(1000, 0)
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		c.add(k, t0)
+	}
+	if n := len(c.m); n != 3 {
+		t.Errorf("cache holds %d entries, want at most 3", n)
+	}
+	if !c.has("e", t0.Add(59*time.Second)) {
+		t.Error("newest entry missing before its TTL")
+	}
+	if c.has("e", t0.Add(time.Minute)) {
+		t.Error("entry still present at its TTL")
+	}
+	if _, ok := c.m["e"]; ok {
+		t.Error("expired entry not removed on lookup")
+	}
+}

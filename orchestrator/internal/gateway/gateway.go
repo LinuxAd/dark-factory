@@ -36,6 +36,9 @@ type Config struct {
 	Transport   http.RoundTripper
 	BackoffBase time.Duration // first retry delay, default 1s
 	Now         func() time.Time
+	// MaxInflightPerToken caps concurrent requests per job token; more get
+	// 429. Default 8.
+	MaxInflightPerToken int
 }
 
 // Server is one gateway instance.
@@ -44,6 +47,8 @@ type Server struct {
 	log     *slog.Logger
 	proxy   *httputil.ReverseProxy
 	metrics *metrics
+	neg     *negCache
+	slots   *inflight
 
 	ready atomic.Bool
 	key   string       // written once in Init, read only after ready is set
@@ -75,7 +80,14 @@ func New(cfg Config) *Server {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	s := &Server{cfg: cfg, log: cfg.Logger, metrics: newMetrics(cfg.Registerer)}
+	if cfg.MaxInflightPerToken == 0 {
+		cfg.MaxInflightPerToken = defaultMaxInflight
+	}
+	s := &Server{
+		cfg: cfg, log: cfg.Logger, metrics: newMetrics(cfg.Registerer),
+		neg:   newNegCache(negCacheTTL, negCacheSize),
+		slots: &inflight{max: cfg.MaxInflightPerToken, n: make(map[string]int)},
+	}
 	s.proxy = &httputil.ReverseProxy{
 		Rewrite:        s.rewrite,
 		Transport:      cfg.Transport,
@@ -248,8 +260,15 @@ func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "authentication_error", "missing bearer token")
 		return
 	}
-	t, err := s.store.LookupToken(r.Context(), HashToken(tok))
+	hash := HashToken(tok)
+	key := string(hash)
+	if s.neg.has(key, s.cfg.Now()) {
+		writeError(w, http.StatusUnauthorized, "authentication_error", errTokenInvalid.Error())
+		return
+	}
+	t, err := s.store.LookupToken(r.Context(), hash)
 	if errors.Is(err, store.ErrTokenNotFound) {
+		s.neg.add(key, s.cfg.Now())
 		writeError(w, http.StatusUnauthorized, "authentication_error", errTokenInvalid.Error())
 		return
 	}
@@ -268,6 +287,16 @@ func (s *Server) serveProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ri.caller = c
+	if !s.slots.acquire(key) {
+		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "too many concurrent requests for this token")
+		return
+	}
+	defer s.slots.release(key)
+	if r.ContentLength > maxRequestBody {
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body too large")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	if err := s.cfg.Budget.Check(r.Context(), c); err != nil {
 		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "budget exceeded: "+err.Error())
 		return
@@ -293,6 +322,12 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 
 func (s *Server) proxyError(w http.ResponseWriter, r *http.Request, err error) {
 	ri := info(r)
+	// The body hit maxRequestBody mid-forward: upstream saw an incomplete
+	// request, so nothing is billed and no row is written.
+	if mbe := (*http.MaxBytesError)(nil); errors.As(err, &mbe) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body too large")
+		return
+	}
 	status := http.StatusBadGateway
 	if r.Context().Err() != nil {
 		status = statusClientClosed

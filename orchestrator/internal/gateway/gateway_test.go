@@ -94,17 +94,27 @@ type env struct {
 
 func newEnv(t *testing.T, h http.HandlerFunc) *env {
 	t.Helper()
+	return newEnvWith(t, h, nil)
+}
+
+// newEnvWith lets a test adjust the gateway Config before New.
+func newEnvWith(t *testing.T, h http.HandlerFunc, adjust func(*Config)) *env {
+	t.Helper()
 	dsn := testpg.New(t)
 	e := &env{dsn: dsn, up: &upstream{handler: h}, logs: &syncBuf{}, reg: prometheus.NewRegistry()}
 	e.upSrv = httptest.NewServer(e.up)
 	t.Cleanup(e.upSrv.Close)
 	u, _ := url.Parse(e.upSrv.URL)
-	e.srv = New(Config{
+	cfg := Config{
 		Upstream:    u,
 		Logger:      slog.New(slog.NewJSONHandler(e.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Registerer:  e.reg,
 		BackoffBase: 10 * time.Millisecond,
-	})
+	}
+	if adjust != nil {
+		adjust(&cfg)
+	}
+	e.srv = New(cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if err := e.srv.Init(ctx, secrets.Static(testKey), dsn); err != nil {
@@ -636,6 +646,163 @@ func TestPathAllowlist(t *testing.T) {
 	}
 	if n := len(e.up.requests()); n != 3 {
 		t.Errorf("upstream received %d requests for allowed paths, want 3", n)
+	}
+}
+
+// A request body over 32 MiB gets 413 and writes no row. With a declared
+// Content-Length it is refused before any upstream call; a chunked body is
+// cut off by http.MaxBytesReader while it is being forwarded.
+func TestRequestBodyLimit(t *testing.T) {
+	e := newEnv(t, serveFixture(t, "message.json"))
+	tok := e.token(t, store.Token{RunID: "run-body", Stage: "build"})
+	send := func(n int64, hideLength bool) (*http.Response, []byte) {
+		t.Helper()
+		var body io.Reader = io.LimitReader(zeros{}, n)
+		if hideLength {
+			body = io.MultiReader(body) // unknown length: sent chunked
+		}
+		req, _ := http.NewRequest(http.MethodPost, e.front.URL+"/v1/messages", body)
+		if !hideLength {
+			req.ContentLength = n
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, _ := io.ReadAll(resp.Body)
+		return resp, b
+	}
+	const limit = 32 << 20
+	resp, body := send(limit+1, false)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || !bytes.Contains(body, []byte(`"request_too_large"`)) {
+		t.Fatalf("declared length over limit: status %d body %s, want 413", resp.StatusCode, body)
+	}
+	if n := len(e.up.requests()); n != 0 {
+		t.Errorf("upstream received %d requests for an oversized body, want 0", n)
+	}
+	if resp, body = send(limit+1, true); resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("chunked body over limit: status %d body %s, want 413", resp.StatusCode, body)
+	}
+	if rows := e.rows(t, "run-body"); len(rows) != 0 {
+		t.Errorf("got %d rows for oversized bodies, want 0", len(rows))
+	}
+	if resp, _ = send(limit, true); resp.StatusCode != 200 {
+		t.Fatalf("body at the limit: status %d, want 200", resp.StatusCode)
+	}
+}
+
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// At most 8 requests per token are in flight (the default); the next gets
+// 429 rate_limit_error without reaching upstream. Other tokens are not
+// affected, and a slot frees when its request ends.
+func TestPerTokenConcurrencyLimit(t *testing.T) {
+	release := make(chan struct{})
+	plain := serveFixture(t, "message.json")
+	e := newEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Test-Block") != "" {
+			<-release
+		}
+		plain(w, r)
+	})
+	tok := e.token(t, store.Token{RunID: "run-conc", Stage: "build"})
+	other := e.token(t, store.Token{RunID: "run-conc-other", Stage: "build"})
+	var wg sync.WaitGroup
+	codes := make([]int, 8)
+	for i := range codes {
+		wg.Go(func() {
+			resp, _ := post(t, e, "/v1/messages", tok, map[string]string{"X-Test-Block": "1"})
+			codes[i] = resp.StatusCode
+		})
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for len(e.up.requests()) < 8 {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatalf("only %d requests reached upstream", len(e.up.requests()))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	resp, body := post(t, e, "/v1/messages", tok, nil)
+	if resp.StatusCode != http.StatusTooManyRequests || !bytes.Contains(body, []byte(`"rate_limit_error"`)) {
+		t.Errorf("9th in-flight request: status %d body %s, want 429 rate_limit_error", resp.StatusCode, body)
+	}
+	if resp, _ := post(t, e, "/v1/messages", other, nil); resp.StatusCode != 200 {
+		t.Errorf("another token: status %d, want 200", resp.StatusCode)
+	}
+	if n := len(e.up.requests()); n != 9 {
+		t.Errorf("upstream received %d requests, want 9 (8 blocked + other token)", n)
+	}
+	close(release)
+	wg.Wait()
+	for i, c := range codes {
+		if c != 200 {
+			t.Errorf("blocked request %d: status %d", i, c)
+		}
+	}
+	if resp, _ := post(t, e, "/v1/messages", tok, nil); resp.StatusCode != 200 {
+		t.Errorf("after the slots freed: status %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestMaxInflightPerTokenConfigurable(t *testing.T) {
+	release := make(chan struct{})
+	e := newEnvWith(t, func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(200)
+	}, func(c *Config) { c.MaxInflightPerToken = 1 })
+	tok := e.token(t, store.Token{RunID: "run-conc1", Stage: "build"})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		post(t, e, "/v1/messages/count_tokens", tok, nil)
+	}()
+	for len(e.up.requests()) < 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil)
+	close(release)
+	<-done
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("second request with limit 1: status %d, want 429", resp.StatusCode)
+	}
+}
+
+// An unknown token is remembered for 30s, so repeats do not reach Postgres:
+// the row inserted after the first miss is not seen until the entry expires.
+func TestUnknownTokenCachedBriefly(t *testing.T) {
+	var now atomic.Pointer[time.Time]
+	start := time.Now()
+	now.Store(&start)
+	e := newEnvWith(t, serveFixture(t, "message.json"), func(c *Config) {
+		c.Now = func() time.Time { return *now.Load() }
+	})
+	tok, hash, err := MintToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 401 {
+		t.Fatalf("unknown token: status %d, want 401", resp.StatusCode)
+	}
+	if err := e.st.CreateToken(context.Background(), hash, store.Token{RunID: "run-neg", Stage: "s", ExpiresAt: start.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	later := start.Add(29 * time.Second)
+	now.Store(&later)
+	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 401 {
+		t.Fatalf("within 30s of the miss: status %d, want 401 from the cache", resp.StatusCode)
+	}
+	expired := start.Add(31 * time.Second)
+	now.Store(&expired)
+	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 200 {
+		t.Fatalf("after the entry expired: status %d, want 200", resp.StatusCode)
 	}
 }
 

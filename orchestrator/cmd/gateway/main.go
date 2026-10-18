@@ -10,6 +10,7 @@
 //	LISTEN_ADDR              proxy, /healthz and /readyz (default :8080)
 //	METRICS_ADDR             /metrics (default :9090)
 //	UPSTREAM_URL             default https://api.anthropic.com
+//	GATEWAY_MAX_INFLIGHT_PER_TOKEN  concurrent requests per job token (default 8)
 //	AWS_REGION and the rest of the AWS SDK default credential chain
 //
 // mint-token uses DATABASE_URL only and prints nothing but the token on stdout.
@@ -26,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -76,10 +78,28 @@ func envOr(getenv func(string) string, k, def string) string {
 	return def
 }
 
-func serve(ctx context.Context, getenv func(string) string, log *slog.Logger) error {
+// gatewayConfig reads the gateway settings that come from the environment.
+func gatewayConfig(getenv func(string) string) (gateway.Config, error) {
+	var cfg gateway.Config
 	upstream, err := url.Parse(envOr(getenv, "UPSTREAM_URL", "https://api.anthropic.com"))
 	if err != nil || upstream.Scheme == "" || upstream.Host == "" {
-		return fmt.Errorf("UPSTREAM_URL is not an absolute URL")
+		return cfg, fmt.Errorf("UPSTREAM_URL is not an absolute URL")
+	}
+	cfg.Upstream = upstream
+	if v := getenv("GATEWAY_MAX_INFLIGHT_PER_TOKEN"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return cfg, fmt.Errorf("GATEWAY_MAX_INFLIGHT_PER_TOKEN must be a positive integer, got %q", v)
+		}
+		cfg.MaxInflightPerToken = n
+	}
+	return cfg, nil
+}
+
+func serve(ctx context.Context, getenv func(string) string, log *slog.Logger) error {
+	cfg, err := gatewayConfig(getenv)
+	if err != nil {
+		return err
 	}
 	secretID := getenv("ANTHROPIC_KEY_SECRET_ID")
 	if secretID == "" {
@@ -92,15 +112,15 @@ func serve(ctx context.Context, getenv func(string) string, log *slog.Logger) er
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	gw := gateway.New(gateway.Config{Upstream: upstream, Logger: log, Registerer: reg})
+	cfg.Logger, cfg.Registerer = log, reg
+	gw := gateway.New(cfg)
 	defer gw.Close()
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	servers := []*http.Server{
-		// No write timeout: streamed responses can run for many minutes.
-		{Addr: envOr(getenv, "LISTEN_ADDR", ":8080"), Handler: gw.Handler(), ReadHeaderTimeout: 10 * time.Second},
-		{Addr: envOr(getenv, "METRICS_ADDR", ":9090"), Handler: metricsMux, ReadHeaderTimeout: 10 * time.Second},
+		newHTTPServer(envOr(getenv, "LISTEN_ADDR", ":8080"), gw.Handler()),
+		newHTTPServer(envOr(getenv, "METRICS_ADDR", ":9090"), metricsMux),
 	}
 	errc := make(chan error, len(servers)+1)
 	for _, s := range servers {
@@ -131,6 +151,18 @@ func serve(ctx context.Context, getenv func(string) string, log *slog.Logger) er
 		return nil
 	}
 	return err
+}
+
+// newHTTPServer sets the connection limits shared by both listeners. There is
+// no write timeout: streamed responses can run for many minutes.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
 }
 
 func mintToken(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) error {
