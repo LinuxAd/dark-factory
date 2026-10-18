@@ -2,7 +2,7 @@
 # host. Bump an image here and every target follows.
 GO_IMAGE   := golang:1.27.2
 LINT_IMAGE := golangci/golangci-lint:v2.14.0
-PG_IMAGE   := postgres:17.11
+PG_IMAGE   := postgres:18.6
 
 # The repo root is mounted so the ../memory module (replace directive) is visible.
 REPO_ROOT := $(abspath $(CURDIR)/..)

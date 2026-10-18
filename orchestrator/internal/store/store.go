@@ -55,7 +55,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("open embedded migrations: %w", err)
 	}
-	locker, err := lock.NewPostgresSessionLocker()
+	// Poll for the lock every second (goose's default is 5s) for the same
+	// 5 minutes in total, so gateways queued behind one another start sooner.
+	locker, err := lock.NewPostgresSessionLocker(lock.WithLockTimeout(1, 300))
 	if err != nil {
 		return fmt.Errorf("create migration lock: %w", err)
 	}
@@ -107,6 +109,17 @@ func (s *Store) LookupToken(ctx context.Context, sha256 []byte) (Token, error) {
 		return Token{}, fmt.Errorf("look up gateway token: %w", err)
 	}
 	return t, nil
+}
+
+// RevokeRunTokens sets revoked_at = now() on every unrevoked token of a run
+// and returns how many it revoked. Already-revoked tokens keep their time.
+func (s *Store) RevokeRunTokens(ctx context.Context, runID string) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE gateway_tokens SET revoked_at = now() WHERE run_id = $1 AND revoked_at IS NULL`, runID)
+	if err != nil {
+		return 0, fmt.Errorf("revoke gateway tokens: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // AgentCall is one agent_calls row. CostUSD nil stores NULL (unpriced model).

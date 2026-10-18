@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
@@ -26,6 +27,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver "pgx"
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/database"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -94,17 +98,27 @@ type env struct {
 
 func newEnv(t *testing.T, h http.HandlerFunc) *env {
 	t.Helper()
+	return newEnvWith(t, h, nil)
+}
+
+// newEnvWith lets a test adjust the gateway Config before New.
+func newEnvWith(t *testing.T, h http.HandlerFunc, adjust func(*Config)) *env {
+	t.Helper()
 	dsn := testpg.New(t)
 	e := &env{dsn: dsn, up: &upstream{handler: h}, logs: &syncBuf{}, reg: prometheus.NewRegistry()}
 	e.upSrv = httptest.NewServer(e.up)
 	t.Cleanup(e.upSrv.Close)
 	u, _ := url.Parse(e.upSrv.URL)
-	e.srv = New(Config{
+	cfg := Config{
 		Upstream:    u,
 		Logger:      slog.New(slog.NewJSONHandler(e.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Registerer:  e.reg,
 		BackoffBase: 10 * time.Millisecond,
-	})
+	}
+	if adjust != nil {
+		adjust(&cfg)
+	}
+	e.srv = New(cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if err := e.srv.Init(ctx, secrets.Static(testKey), dsn); err != nil {
@@ -395,6 +409,25 @@ func TestUnauthenticatedRejectedWithoutUpstreamCall(t *testing.T) {
 	}
 }
 
+// Revocation takes effect on the next request: lookups are never cached for
+// a token that exists.
+func TestRevokedTokenRejectedOnNextRequest(t *testing.T) {
+	e := newEnv(t, serveFixture(t, "message.json"))
+	tok := e.token(t, store.Token{RunID: "run-rev", Stage: "build"})
+	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 200 {
+		t.Fatalf("before revoke: status %d", resp.StatusCode)
+	}
+	if n, err := e.st.RevokeRunTokens(context.Background(), "run-rev"); err != nil || n != 1 {
+		t.Fatalf("RevokeRunTokens: %d, %v", n, err)
+	}
+	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 401 {
+		t.Errorf("after revoke: status %d, want 401", resp.StatusCode)
+	}
+	if n := len(e.up.requests()); n != 1 {
+		t.Errorf("upstream received %d requests, want 1", n)
+	}
+}
+
 // AC2 (d): token plus mismatching X-Factory-Run -> 403.
 func TestHeaderTokenMismatchForbidden(t *testing.T) {
 	e := newEnv(t, serveFixture(t, "message.json"))
@@ -569,6 +602,265 @@ func TestNonMessagesPathsPassThroughWithoutRow(t *testing.T) {
 	}
 }
 
+// do sends a bodyless request with a bearer token. rawURL is appended to the
+// gateway URL unparsed, so escaped paths reach the server as written.
+func do(t *testing.T, e *env, method, rawURL, tok string) (*http.Response, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(method, e.front.URL+rawURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	return resp, body
+}
+
+// Only the four allowlisted routes are forwarded; Batches, Files and any
+// other path or method get 404 with no upstream call and no row.
+func TestPathAllowlist(t *testing.T) {
+	e := newEnv(t, serveFixture(t, "message.json"))
+	tok := e.token(t, store.Token{RunID: "run-allow", Stage: "build"})
+	denied := []struct{ method, url string }{
+		{"POST", "/v1/messages/batches"},
+		{"GET", "/v1/messages/batches"},
+		{"GET", "/v1/files"},
+		{"POST", "/v1/files"},
+		{"POST", "/v1/messages/"},
+		{"POST", "/v1//messages"},
+		{"POST", "/v1/messages/count_tokens/"},
+		{"GET", "/v1/models/"},
+		{"GET", "/v1/models/a/b"},
+		{"GET", "/v1/models/.."},
+		{"GET", "/v1/models/claude%2Dopus-5-5"}, // non-empty RawPath
+		{"GET", "/v1/models/a%2Fb"},
+		{"GET", "/v1/messages"},
+		{"POST", "/v1/models"},
+		{"DELETE", "/v1/models/claude-opus-5-5"},
+		{"GET", "/v1/organizations/me"},
+		{"GET", "/"},
+	}
+	for _, c := range denied {
+		resp, body := do(t, e, c.method, c.url, tok)
+		if resp.StatusCode != http.StatusNotFound || !bytes.Contains(body, []byte(`"not_found_error"`)) {
+			t.Errorf("%s %s: status %d body %s, want 404 not_found_error", c.method, c.url, resp.StatusCode, body)
+		}
+	}
+	if n := len(e.up.requests()); n != 0 {
+		t.Errorf("upstream received %d requests for denied paths, want 0", n)
+	}
+	if rows := e.rows(t, "run-allow"); len(rows) != 0 {
+		t.Errorf("got %d rows for denied paths", len(rows))
+	}
+	for _, c := range []struct{ method, url string }{
+		{"GET", "/v1/models"},
+		{"GET", "/v1/models/claude-opus-5-5"},
+		{"POST", "/v1/messages/count_tokens"},
+	} {
+		if resp, _ := do(t, e, c.method, c.url, tok); resp.StatusCode != 200 {
+			t.Errorf("%s %s: status %d, want 200", c.method, c.url, resp.StatusCode)
+		}
+	}
+	if n := len(e.up.requests()); n != 3 {
+		t.Errorf("upstream received %d requests for allowed paths, want 3", n)
+	}
+}
+
+// A request body over 32 MiB gets 413 and writes no row. With a declared
+// Content-Length it is refused before any upstream call; a chunked body is
+// cut off by http.MaxBytesReader while it is being forwarded.
+func TestRequestBodyLimit(t *testing.T) {
+	e := newEnv(t, serveFixture(t, "message.json"))
+	tok := e.token(t, store.Token{RunID: "run-body", Stage: "build"})
+	send := func(n int64, hideLength bool) (*http.Response, []byte) {
+		t.Helper()
+		body := io.LimitReader(zeros{}, n)
+		if hideLength {
+			body = io.MultiReader(body) // unknown length: sent chunked
+		}
+		req, _ := http.NewRequest(http.MethodPost, e.front.URL+"/v1/messages", body)
+		if !hideLength {
+			req.ContentLength = n
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, _ := io.ReadAll(resp.Body)
+		return resp, b
+	}
+	const limit = 32 << 20
+	resp, body := send(limit+1, false)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || !bytes.Contains(body, []byte(`"request_too_large"`)) {
+		t.Fatalf("declared length over limit: status %d body %s, want 413", resp.StatusCode, body)
+	}
+	if n := len(e.up.requests()); n != 0 {
+		t.Errorf("upstream received %d requests for an oversized body, want 0", n)
+	}
+	if resp, body = send(limit+1, true); resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("chunked body over limit: status %d body %s, want 413", resp.StatusCode, body)
+	}
+	if rows := e.rows(t, "run-body"); len(rows) != 0 {
+		t.Errorf("got %d rows for oversized bodies, want 0", len(rows))
+	}
+	if resp, _ = send(limit, true); resp.StatusCode != 200 {
+		t.Fatalf("body at the limit: status %d, want 200", resp.StatusCode)
+	}
+}
+
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// At most 8 requests per token are in flight (the default); the next gets
+// 429 rate_limit_error without reaching upstream. Other tokens are not
+// affected, and a slot frees when its request ends.
+func TestPerTokenConcurrencyLimit(t *testing.T) {
+	release := make(chan struct{})
+	plain := serveFixture(t, "message.json")
+	e := newEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Test-Block") != "" {
+			<-release
+		}
+		plain(w, r)
+	})
+	tok := e.token(t, store.Token{RunID: "run-conc", Stage: "build"})
+	other := e.token(t, store.Token{RunID: "run-conc-other", Stage: "build"})
+	var wg sync.WaitGroup
+	codes := make([]int, 8)
+	for i := range codes {
+		wg.Go(func() {
+			resp, _ := post(t, e, "/v1/messages", tok, map[string]string{"X-Test-Block": "1"})
+			codes[i] = resp.StatusCode
+		})
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for len(e.up.requests()) < 8 {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatalf("only %d requests reached upstream", len(e.up.requests()))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	resp, body := post(t, e, "/v1/messages", tok, nil)
+	if resp.StatusCode != http.StatusTooManyRequests || !bytes.Contains(body, []byte(`"rate_limit_error"`)) {
+		t.Errorf("9th in-flight request: status %d body %s, want 429 rate_limit_error", resp.StatusCode, body)
+	}
+	if resp, _ := post(t, e, "/v1/messages", other, nil); resp.StatusCode != 200 {
+		t.Errorf("another token: status %d, want 200", resp.StatusCode)
+	}
+	if n := len(e.up.requests()); n != 9 {
+		t.Errorf("upstream received %d requests, want 9 (8 blocked + other token)", n)
+	}
+	close(release)
+	wg.Wait()
+	for i, c := range codes {
+		if c != 200 {
+			t.Errorf("blocked request %d: status %d", i, c)
+		}
+	}
+	if resp, _ := post(t, e, "/v1/messages", tok, nil); resp.StatusCode != 200 {
+		t.Errorf("after the slots freed: status %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestMaxInflightPerTokenConfigurable(t *testing.T) {
+	release := make(chan struct{})
+	e := newEnvWith(t, func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(200)
+	}, func(c *Config) { c.MaxInflightPerToken = 1 })
+	tok := e.token(t, store.Token{RunID: "run-conc1", Stage: "build"})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		post(t, e, "/v1/messages/count_tokens", tok, nil)
+	}()
+	for len(e.up.requests()) < 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil)
+	close(release)
+	<-done
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("second request with limit 1: status %d, want 429", resp.StatusCode)
+	}
+}
+
+// An unknown token is remembered for 30s, so repeats do not reach Postgres:
+// the row inserted after the first miss is not seen until the entry expires.
+func TestUnknownTokenCachedBriefly(t *testing.T) {
+	var now atomic.Pointer[time.Time]
+	start := time.Now()
+	now.Store(&start)
+	e := newEnvWith(t, serveFixture(t, "message.json"), func(c *Config) {
+		c.Now = func() time.Time { return *now.Load() }
+	})
+	tok, hash, err := MintToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 401 {
+		t.Fatalf("unknown token: status %d, want 401", resp.StatusCode)
+	}
+	if err := e.st.CreateToken(context.Background(), hash, store.Token{RunID: "run-neg", Stage: "s", ExpiresAt: start.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	later := start.Add(29 * time.Second)
+	now.Store(&later)
+	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 401 {
+		t.Fatalf("within 30s of the miss: status %d, want 401 from the cache", resp.StatusCode)
+	}
+	expired := start.Add(31 * time.Second)
+	now.Store(&expired)
+	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 200 {
+		t.Fatalf("after the entry expired: status %d, want 200", resp.StatusCode)
+	}
+}
+
+type panicBudget struct{ v any }
+
+func (b panicBudget) Check(context.Context, Caller) error { panic(b.v) }
+
+// Only http.ErrAbortHandler (ReverseProxy on a broken copy) counts as 499;
+// any other panic is a gateway bug and counts as 500.
+func TestPanicStatus(t *testing.T) {
+	for name, c := range map[string]struct {
+		v    any
+		want string
+	}{
+		"abort": {http.ErrAbortHandler, "499"},
+		"bug":   {"boom", "500"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnvWith(t, serveFixture(t, "message.json"), func(cfg *Config) { cfg.Budget = panicBudget{c.v} })
+			tok := e.token(t, store.Token{RunID: "run-panic", Stage: "build"})
+			req, _ := http.NewRequest(http.MethodPost, e.front.URL+"/v1/messages/count_tokens", strings.NewReader("{}"))
+			req.Header.Set("Authorization", "Bearer "+tok)
+			if resp, err := http.DefaultClient.Do(req); err == nil {
+				_ = resp.Body.Close()
+			}
+			if got := testutil.ToFloat64(e.srv.metrics.requests.WithLabelValues(c.want)); got != 1 {
+				t.Errorf("gateway_requests_total{code=%s} = %v, want 1", c.want, got)
+			}
+			if !strings.Contains(e.logs.String(), `"status":`+c.want) {
+				t.Errorf("no request log with status %s:\n%s", c.want, e.logs.String())
+			}
+		})
+	}
+}
+
 // AC2 (i): captured logs never contain the configured key (or job tokens).
 func TestLogsNeverContainKey(t *testing.T) {
 	var mode atomic.Value
@@ -617,25 +909,43 @@ func TestLogsNeverContainKey(t *testing.T) {
 	}
 }
 
-// AC2 (j): two gateways starting at once both come up, migrations ran once.
+// AC2 (j): gateways starting at once all migrate successfully, and each
+// migration is applied once. Every gateway runs store.Migrate on its own
+// pool exactly once, with no retry, released together. The goose version
+// table exists beforehand, as on any database a gateway has started against
+// before; on an empty database goose's own retry around creating that table
+// staggers the callers by a second and would hide a missing lock. Without
+// the advisory lock the callers race to CREATE TABLE and some fail.
 func TestConcurrentStartupMigratesOnce(t *testing.T) {
 	dsn := testpg.New(t)
-	u, _ := url.Parse("http://127.0.0.1:1")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	var wg sync.WaitGroup
-	servers := make([]*Server, 2)
-	errs := make([]error, 2)
-	for i := range servers {
-		servers[i] = New(Config{Upstream: u, Logger: slog.New(slog.DiscardHandler), BackoffBase: 10 * time.Millisecond})
-		wg.Go(func() { errs[i] = servers[i].Init(ctx, secrets.Static(testKey), dsn) })
-	}
-	wg.Wait()
-	for i, s := range servers {
-		if errs[i] != nil || !s.Ready() {
-			t.Fatalf("gateway %d: ready=%v err=%v", i, s.Ready(), errs[i])
+	createGooseVersionTable(t, dsn)
+	const n = 6
+	stores := make([]*store.Store, n)
+	for i := range stores {
+		st, err := store.Open(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
 		}
-		defer s.Close()
+		defer st.Close()
+		stores[i] = st
+	}
+	start := make(chan struct{})
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i, st := range stores {
+		wg.Go(func() {
+			<-start
+			errs[i] = st.Migrate(ctx)
+		})
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("gateway %d: Migrate: %v", i, err)
+		}
 	}
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
@@ -710,6 +1020,82 @@ func TestInitGivesUpWhenContextEnds(t *testing.T) {
 	err := s.Init(ctx, secrets.Static(testKey), "postgres://nobody@127.0.0.1:1/none?connect_timeout=1")
 	if err == nil || s.Ready() {
 		t.Fatalf("want error and not ready, got %v ready=%v", err, s.Ready())
+	}
+}
+
+// Close called while Init is running (as serve's deferred Close does when a
+// signal arrives during startup) must not race Init, and must not leave the
+// pool Init opened behind. Run with -race.
+func TestCloseDuringInit(t *testing.T) {
+	for name, cancelFirst := range map[string]bool{"close only": false, "cancel then close": true} {
+		t.Run(name, func(t *testing.T) {
+			dsn := testpg.New(t)
+			u, _ := url.Parse("http://127.0.0.1:1")
+			s := New(Config{Upstream: u, Logger: slog.New(slog.DiscardHandler), BackoffBase: 10 * time.Millisecond})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			started := make(chan struct{})
+			keys := keyFunc(func(context.Context) (string, error) {
+				close(started)
+				return testKey, nil
+			})
+			errc := make(chan error, 1)
+			go func() { errc <- s.Init(ctx, keys, dsn) }()
+			<-started
+			if cancelFirst {
+				cancel()
+			}
+			s.Close()
+			err := <-errc
+			if err == nil && !s.Ready() {
+				t.Error("Init returned nil but the server is not ready")
+			}
+			// Whichever finished first, no connection may remain open.
+			pu, _ := url.Parse(dsn)
+			conn, cerr := pgx.Connect(context.Background(), dsn)
+			if cerr != nil {
+				t.Fatal(cerr)
+			}
+			defer func() { _ = conn.Close(context.Background()) }()
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				var n int
+				if err := conn.QueryRow(context.Background(),
+					`SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
+					strings.TrimPrefix(pu.Path, "/")).Scan(&n); err != nil {
+					t.Fatal(err)
+				}
+				if n == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("%d connections still open after Close (Init err %v)", n, err)
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		})
+	}
+}
+
+// createGooseVersionTable creates goose's version table at version 0 using
+// goose's own Postgres store, so the schema is whatever goose expects.
+func createGooseVersionTable(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	gs, err := database.NewStore(database.DialectPostgres, goose.DefaultTablename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.CreateVersionTable(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.Insert(ctx, db, database.InsertRequest{Version: 0}); err != nil {
+		t.Fatal(err)
 	}
 }
 
