@@ -37,7 +37,7 @@ Desktop.
 
 | Path | What |
 |---|---|
-| `cmd/gateway` | `gateway serve` (default) and `gateway mint-token` |
+| `cmd/gateway` | `gateway serve` (default), `gateway mint-token` and `gateway revoke-token` |
 | `internal/gateway` | reverse proxy, token auth, header rules, metering, budget hook, probes, metrics |
 | `internal/usage` | SSE/JSON usage parser; fixtures in `testdata/` (synthetic, see its README) |
 | `internal/pricing` | per-model prices, integer nano-USD arithmetic |
@@ -70,10 +70,19 @@ read 10 s, request body 32 MiB (413 `request_too_large` above, no row). An
 unknown token is remembered for 30 s (at most 10,000 entries) so repeated
 bad tokens get 401 without a database lookup.
 
-Mint a job token (prints only the token on stdout):
+Mint a job token (prints only the token on stdout; `--ttl` defaults to 1h
+and above 2h is rejected):
 
 ```sh
 kubectl exec deploy/gateway -n factory -- /gateway mint-token --run R --task T --stage S --ttl 1h
+```
+
+Revoke every token of a run (sets `revoked_at = now()` on its unrevoked
+tokens, prints the number revoked, e.g. `2`, and exits 0 even when that is
+`0`; the next request with a revoked token gets 401):
+
+```sh
+kubectl exec deploy/gateway -n factory -- /gateway revoke-token --run R
 ```
 
 Metrics: `gateway_requests_total{code}`, `gateway_upstream_latency_seconds`,

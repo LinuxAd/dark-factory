@@ -1,7 +1,8 @@
 // Command gateway is the factory's model gateway (SPEC.md §7.3).
 //
 //	gateway [serve]                                   run the proxy (default)
-//	gateway mint-token --run R [--task T] --stage S [--ttl 1h]
+//	gateway mint-token --run R [--task T] --stage S [--ttl 1h]   (ttl at most 2h)
+//	gateway revoke-token --run R                      revoke every token of a run
 //
 // Environment (serve):
 //
@@ -13,7 +14,9 @@
 //	GATEWAY_MAX_INFLIGHT_PER_TOKEN  concurrent requests per job token (default 8)
 //	AWS_REGION and the rest of the AWS SDK default credential chain
 //
-// mint-token uses DATABASE_URL only and prints nothing but the token on stdout.
+// mint-token and revoke-token use DATABASE_URL only. mint-token prints
+// nothing but the token on stdout; revoke-token prints the number of tokens
+// it revoked (0 is not an error).
 package main
 
 import (
@@ -65,8 +68,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 			return 1
 		}
 		return 0
+	case "revoke-token":
+		if err := revokeToken(ctx, args, getenv, stdout, stderr); err != nil {
+			_, _ = fmt.Fprintln(stderr, "revoke-token:", err)
+			return 1
+		}
+		return 0
 	default:
-		_, _ = fmt.Fprintf(stderr, "unknown command %q (want serve or mint-token)\n", cmd)
+		_, _ = fmt.Fprintf(stderr, "unknown command %q (want serve, mint-token or revoke-token)\n", cmd)
 		return 2
 	}
 }
@@ -165,6 +174,9 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 	}
 }
 
+// maxTokenTTL caps a job token's lifetime so a leaked token is short-lived.
+const maxTokenTTL = 2 * time.Hour
+
 func mintToken(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("mint-token", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -178,8 +190,8 @@ func mintToken(ctx context.Context, args []string, getenv func(string) string, s
 	if *run == "" || *stage == "" {
 		return errors.New("--run and --stage are required")
 	}
-	if *ttl <= 0 {
-		return errors.New("--ttl must be positive")
+	if *ttl <= 0 || *ttl > maxTokenTTL {
+		return fmt.Errorf("--ttl must be positive and at most %s", maxTokenTTL)
 	}
 	st, err := store.Open(ctx, getenv("DATABASE_URL"))
 	if err != nil {
@@ -194,5 +206,28 @@ func mintToken(ctx context.Context, args []string, getenv func(string) string, s
 		return err
 	}
 	_, err = fmt.Fprintln(stdout, tok)
+	return err
+}
+
+func revokeToken(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("revoke-token", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	run := fs.String("run", "", "run id whose tokens to revoke (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *run == "" {
+		return errors.New("--run is required")
+	}
+	st, err := store.Open(ctx, getenv("DATABASE_URL"))
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	n, err := st.RevokeRunTokens(ctx, *run)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, n)
 	return err
 }

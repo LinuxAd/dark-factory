@@ -118,3 +118,73 @@ func TestGatewayConfigFromEnv(t *testing.T) {
 		}
 	}
 }
+
+func TestMintTokenRejectsTTLOverTwoHours(t *testing.T) {
+	var out, errOut bytes.Buffer
+	args := []string{"mint-token", "--run", "r", "--stage", "s", "--ttl", "2h1s"}
+	if code := run(context.Background(), args, func(string) string { return "" }, &out, &errOut); code == 0 {
+		t.Fatal("want non-zero exit for --ttl over 2h")
+	}
+	if out.Len() != 0 || !strings.Contains(errOut.String(), "2h") {
+		t.Errorf("stdout %q stderr %q: want no token and an error naming the 2h cap", out.String(), errOut.String())
+	}
+}
+
+func TestRevokeToken(t *testing.T) {
+	ctx := context.Background()
+	dsn := testpg.New(t)
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	env := func(k string) string {
+		if k == "DATABASE_URL" {
+			return dsn
+		}
+		return ""
+	}
+	mint := func(run string) []byte {
+		_, hash, err := gateway.MintToken()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.CreateToken(ctx, hash, store.Token{RunID: run, Stage: "s", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+		return hash
+	}
+	r1, r2, other := mint("run-r"), mint("run-r"), mint("run-other")
+	revoke := func(runID string) string {
+		t.Helper()
+		var out, errOut bytes.Buffer
+		if code := run(ctx, []string{"revoke-token", "--run", runID}, env, &out, &errOut); code != 0 {
+			t.Fatalf("revoke-token --run %s: exit %d, stderr %s", runID, code, errOut.String())
+		}
+		return out.String()
+	}
+	if got := revoke("run-r"); got != "2\n" {
+		t.Errorf("first revoke printed %q, want \"2\\n\"", got)
+	}
+	for _, h := range [][]byte{r1, r2} {
+		if tok, err := st.LookupToken(ctx, h); err != nil || tok.RevokedAt == nil {
+			t.Errorf("run-r token not revoked: %+v %v", tok, err)
+		}
+	}
+	if tok, err := st.LookupToken(ctx, other); err != nil || tok.RevokedAt != nil {
+		t.Errorf("other run's token was touched: %+v %v", tok, err)
+	}
+	if got := revoke("run-r"); got != "0\n" {
+		t.Errorf("second revoke printed %q, want \"0\\n\"", got)
+	}
+	if got := revoke("no-such-run"); got != "0\n" {
+		t.Errorf("unknown run printed %q, want \"0\\n\"", got)
+	}
+	var out, errOut bytes.Buffer
+	if code := run(ctx, []string{"revoke-token"}, env, &out, &errOut); code == 0 || out.Len() != 0 {
+		t.Errorf("without --run: exit %d stdout %q, want non-zero and empty", code, out.String())
+	}
+}

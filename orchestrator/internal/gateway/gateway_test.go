@@ -405,6 +405,25 @@ func TestUnauthenticatedRejectedWithoutUpstreamCall(t *testing.T) {
 	}
 }
 
+// Revocation takes effect on the next request: lookups are never cached for
+// a token that exists.
+func TestRevokedTokenRejectedOnNextRequest(t *testing.T) {
+	e := newEnv(t, serveFixture(t, "message.json"))
+	tok := e.token(t, store.Token{RunID: "run-rev", Stage: "build"})
+	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 200 {
+		t.Fatalf("before revoke: status %d", resp.StatusCode)
+	}
+	if n, err := e.st.RevokeRunTokens(context.Background(), "run-rev"); err != nil || n != 1 {
+		t.Fatalf("RevokeRunTokens: %d, %v", n, err)
+	}
+	if resp, _ := post(t, e, "/v1/messages/count_tokens", tok, nil); resp.StatusCode != 401 {
+		t.Errorf("after revoke: status %d, want 401", resp.StatusCode)
+	}
+	if n := len(e.up.requests()); n != 1 {
+		t.Errorf("upstream received %d requests, want 1", n)
+	}
+}
+
 // AC2 (d): token plus mismatching X-Factory-Run -> 403.
 func TestHeaderTokenMismatchForbidden(t *testing.T) {
 	e := newEnv(t, serveFixture(t, "message.json"))
