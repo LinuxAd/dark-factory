@@ -1,5 +1,20 @@
 # orchestrator
 
+> **Accepted for Phase 0, fix before Phase 1** (ADR 0001):
+>
+> - Server tools and MCP connectors in request bodies get around the egress
+>   allowlist: the gateway forwards bodies untouched, so `web_fetch`,
+>   `web_search` and `mcp_servers` make Anthropic reach the internet on the
+>   agent's behalf (security review M1).
+> - The `anthropic-beta` header is forwarded unfiltered, so a caller can turn
+>   on any beta feature.
+> - The gateway starts listening before Init (key fetch, database,
+>   migrations) finishes; `/readyz` returns 503 until then, and the proxy
+>   answers 503 too, so traffic is gated by readiness, not by the listener.
+> - The `agent_calls` row is written before the response body is closed, so
+>   the end of every `POST /v1/messages` response waits for that insert (up
+>   to 10 s if Postgres is slow).
+
 Go module for the factory's services. Phase 0 ships one binary,
 `cmd/gateway`, the model gateway (SPEC.md §7.3, ADR 0001 Decisions D–F).
 
