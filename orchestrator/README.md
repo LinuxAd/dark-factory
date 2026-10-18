@@ -84,7 +84,12 @@ escaped path) gets 404 `not_found_error` with no upstream call. Only
 Limits: request headers 64 KiB (431 above), idle keep-alive 90 s, header
 read 10 s, request body 32 MiB (413 `request_too_large` above, no row). An
 unknown token is remembered for 30 s (at most 10,000 entries) so repeated
-bad tokens get 401 without a database lookup.
+bad tokens get 401 without a database lookup. That cache does not absorb a
+flood of distinct random tokens: each is a Postgres lookup. There is no
+global rate limiter. The load on Postgres is bounded by the pgx pool size
+(pgx default `max(4, NumCPU)`, or `pool_max_conns` in `DATABASE_URL`), which
+queues lookups beyond its connections, plus the per-token in-flight cap
+(taken after the lookup) on what valid tokens add.
 
 Mint a job token (prints only the token on stdout; `--ttl` defaults to 1h
 and above 2h is rejected):

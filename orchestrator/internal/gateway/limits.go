@@ -12,7 +12,11 @@ const (
 	// Config.MaxInflightPerToken is 0.
 	defaultMaxInflight = 8
 	// negCacheTTL and negCacheSize bound the unknown-token cache, which
-	// stops a flood of made-up tokens from reaching Postgres.
+	// answers a repeated bad token without a Postgres lookup. It does not
+	// stop a flood of distinct made-up tokens: each one is a lookup. The
+	// pgx pool size bounds concurrent lookups (the rest queue for a
+	// connection) and the per-token in-flight cap bounds what valid tokens
+	// add; there is no global limiter.
 	negCacheTTL  = 30 * time.Second
 	negCacheSize = 10000
 )
