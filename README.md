@@ -1,5 +1,13 @@
 # Dark Factory
 
+## Why "dark factory"?
+
+A "dark factory", also called "lights-out manufacturing", is a plant automated enough to run without people on site, so the lights can be switched off. The best-known example is FANUC in Japan, whose robots build other robots unattended for long stretches.
+
+The term carries over to software. A dark software factory turns specifications into working code with no human writing the code. Humans write the spec and review or merge the result, and the factory does the rest.
+
+This repo applies that model to one pipeline. A human writes an idea as a GitHub issue and signs off at three gates. In between, the factory writes all the code, and the result must pass hidden acceptance scenarios that the implementing agents never see.
+
 The factory turns an idea written as a GitHub issue into a GitHub repo whose code passes hidden acceptance scenarios, with no human writing code. `SPEC.md` is the specification and `CLAUDE.md` holds the rules for building it.
 
 ## Phase 0: foundations
