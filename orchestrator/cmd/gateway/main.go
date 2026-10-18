@@ -1,0 +1,166 @@
+// Command gateway is the factory's model gateway (SPEC.md §7.3).
+//
+//	gateway [serve]                                   run the proxy (default)
+//	gateway mint-token --run R [--task T] --stage S [--ttl 1h]
+//
+// Environment (serve):
+//
+//	ANTHROPIC_KEY_SECRET_ID  Secrets Manager secret holding the key (required)
+//	DATABASE_URL             Postgres DSN; empty falls back to libpq PG* variables
+//	LISTEN_ADDR              proxy, /healthz and /readyz (default :8080)
+//	METRICS_ADDR             /metrics (default :9090)
+//	UPSTREAM_URL             default https://api.anthropic.com
+//	AWS_REGION and the rest of the AWS SDK default credential chain
+//
+// mint-token uses DATABASE_URL only and prints nothing but the token on stdout.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/LinuxAd/dark-factory/orchestrator/internal/gateway"
+	"github.com/LinuxAd/dark-factory/orchestrator/internal/secrets"
+	"github.com/LinuxAd/dark-factory/orchestrator/internal/store"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	os.Exit(run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
+}
+
+func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
+	cmd := "serve"
+	if len(args) > 0 {
+		cmd, args = args[0], args[1:]
+	}
+	switch cmd {
+	case "serve":
+		log := slog.New(slog.NewJSONHandler(stdout, nil))
+		if err := serve(ctx, getenv, log); err != nil {
+			log.Error("gateway stopped", "error", err.Error())
+			return 1
+		}
+		return 0
+	case "mint-token":
+		if err := mintToken(ctx, args, getenv, stdout, stderr); err != nil {
+			_, _ = fmt.Fprintln(stderr, "mint-token:", err)
+			return 1
+		}
+		return 0
+	default:
+		_, _ = fmt.Fprintf(stderr, "unknown command %q (want serve or mint-token)\n", cmd)
+		return 2
+	}
+}
+
+func envOr(getenv func(string) string, k, def string) string {
+	if v := getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func serve(ctx context.Context, getenv func(string) string, log *slog.Logger) error {
+	upstream, err := url.Parse(envOr(getenv, "UPSTREAM_URL", "https://api.anthropic.com"))
+	if err != nil || upstream.Scheme == "" || upstream.Host == "" {
+		return fmt.Errorf("UPSTREAM_URL is not an absolute URL")
+	}
+	secretID := getenv("ANTHROPIC_KEY_SECRET_ID")
+	if secretID == "" {
+		return errors.New("ANTHROPIC_KEY_SECRET_ID is required")
+	}
+	keys, err := secrets.NewManager(ctx, secretID)
+	if err != nil {
+		return err
+	}
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	gw := gateway.New(gateway.Config{Upstream: upstream, Logger: log, Registerer: reg})
+	defer gw.Close()
+
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	servers := []*http.Server{
+		// No write timeout: streamed responses can run for many minutes.
+		{Addr: envOr(getenv, "LISTEN_ADDR", ":8080"), Handler: gw.Handler(), ReadHeaderTimeout: 10 * time.Second},
+		{Addr: envOr(getenv, "METRICS_ADDR", ":9090"), Handler: metricsMux, ReadHeaderTimeout: 10 * time.Second},
+	}
+	errc := make(chan error, len(servers)+1)
+	for _, s := range servers {
+		log.Info("listening", "addr", s.Addr)
+		go func() {
+			if err := s.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+				errc <- fmt.Errorf("listen %s: %w", s.Addr, err)
+			}
+		}()
+	}
+	go func() {
+		if err := gw.Init(ctx, keys, getenv("DATABASE_URL")); err != nil {
+			errc <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Info("shutting down")
+	case err = <-errc:
+	}
+	sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, s := range servers {
+		_ = s.Shutdown(sctx)
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
+}
+
+func mintToken(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("mint-token", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	run := fs.String("run", "", "run id (required)")
+	task := fs.String("task", "", "task id")
+	stage := fs.String("stage", "", "stage (required)")
+	ttl := fs.Duration("ttl", time.Hour, "token lifetime")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *run == "" || *stage == "" {
+		return errors.New("--run and --stage are required")
+	}
+	if *ttl <= 0 {
+		return errors.New("--ttl must be positive")
+	}
+	st, err := store.Open(ctx, getenv("DATABASE_URL"))
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	tok, hash, err := gateway.MintToken()
+	if err != nil {
+		return err
+	}
+	if err := st.CreateToken(ctx, hash, store.Token{RunID: *run, TaskID: *task, Stage: *stage, ExpiresAt: time.Now().Add(*ttl)}); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, tok)
+	return err
+}
