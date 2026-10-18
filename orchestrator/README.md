@@ -8,9 +8,9 @@ Docker image (tags at the top of the `Makefile`):
 
 | Image | Used by |
 |---|---|
-| `golang:1.27.2` | `test`, `test-unit`, `build`, `tidy`, and the `Dockerfile` build stage |
+| `golang:1.27.2` | `test`, `test-unit`, `build`, `tidy`, and the `Dockerfile` build stage (pinned there by `@sha256` digest) |
 | `golangci/golangci-lint:v2.14.0` | `lint` (config in `.golangci.yml`) |
-| `postgres:17.11` | `test` (throwaway database) |
+| `postgres:18.6` | `test` (throwaway database) |
 
 ```sh
 make -C orchestrator test lint build   # the AC1/AC2 gate
@@ -23,7 +23,7 @@ Module caches live in the Docker volumes `df-gomod`, `df-gocache` and
 
 ## How the integration tests reach Postgres
 
-`make test` starts `postgres:17.11` in a container, waits for `pg_isready`,
+`make test` starts `postgres:18.6` in a container, waits for `pg_isready`,
 then runs `go test` in a Go container that joins the Postgres container's
 network namespace (`--network container:<pg>`) with
 `GATEWAY_TEST_DATABASE_URL=postgres://postgres:test@127.0.0.1:5432/postgres`.

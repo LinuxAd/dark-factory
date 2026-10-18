@@ -1,6 +1,6 @@
 # Gateway image. Build from the repo root so the ../memory module is in the
 # context:  docker build -f orchestrator/Dockerfile -t factory-gateway .
-FROM --platform=$BUILDPLATFORM golang:1.27.2 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.2@sha256:820153096fda4de6ac1b7194d12e416b7dd8f4e9a33d17e0345b111b945162d8 AS build
 ARG TARGETOS=linux
 ARG TARGETARCH
 WORKDIR /src
