@@ -1,0 +1,20 @@
+{{/* Argo CD creates the factory namespace (CreateNamespace=true) without
+labels; rendering it here adds the Pod Security labels. Sandbox Jobs run in a
+separate namespace that holds no Secret except per-Job tokens, so no Job
+template can mount the database credentials. */}}
+{{- if ne .Release.Namespace "factory" }}
+{{- fail "the chart must be installed into namespace factory: the Pod Identity associations and sandbox URLs name it" }}
+{{- end }}
+{{- range $ns := list .Release.Namespace .Values.sandboxNamespace }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "factory.labels" $ | nindent 4 }}
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+{{- end }}

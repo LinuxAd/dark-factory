@@ -1,0 +1,6 @@
+apiVersion: v2
+name: factory
+description: Dark Factory Phase 0 - model gateway, Postgres (CloudNativePG), egress proxy and the sandbox namespace
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
