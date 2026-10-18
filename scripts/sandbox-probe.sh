@@ -6,8 +6,14 @@
 #
 # CONTROL=1: runs the same pod spec in a throwaway namespace
 # factory-probe-control-<ts> that has the Pod Security restricted label but no
-# NetworkPolicies, then deletes it. There the probe is expected to fail (this
-# target exits non-zero), which shows the policies are what isolate the pod.
+# NetworkPolicies, then deletes it. The Job's wait-for-policy init container is
+# left out there (it could only time out), so the probe itself meets the open
+# egress. Exit codes in control mode:
+#   1  expected (AC4): the probe ran and reported FAIL direct-anthropic, which
+#      shows the policies are what isolate the pod
+#   3  inconclusive: the Job failed for another reason (image pull, scheduling,
+#      the probe never ran, or it failed only on other checks)
+#   0  unexpected: the probe passed without NetworkPolicies
 # Deleting a policy in factory-sandbox would prove nothing: a pod selected by
 # any egress policy stays isolated, and Argo CD self-heal restores it.
 #
@@ -30,14 +36,20 @@ else
   namespace="${FACTORY_SANDBOX_NAMESPACE}"
 fi
 
+# EXIT trap: revoke the run's gateway token and remove the Secret (or the
+# control namespace), all best-effort, then exit with the script's own status.
 # shellcheck disable=SC2329 # invoked by the EXIT trap.
 cleanup() {
+  local rc=$?
+  revoke_token "${run_id}"
   if [[ "${control}" == 1 ]]; then
     log "deleting control namespace ${namespace}"
     kc delete namespace "${namespace}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   else
     kc --namespace "${namespace}" delete secret "${secret}" --ignore-not-found >/dev/null 2>&1 || true
   fi
+  [[ -z "${logfile:-}" ]] || rm -f "${logfile}"
+  exit "${rc}"
 }
 trap cleanup EXIT
 
@@ -63,24 +75,30 @@ automountServiceAccountToken: false
 EOF
 fi
 
+# 1h: well inside the gateway's 2h mint-token cap; revoked on exit anyway.
 log "minting a gateway token for run ${run_id}"
 token="$(mint_token "${run_id}" probe phase0-probe 1h)"
 create_token_secret "${namespace}" "${secret}" "${token}"
 unset token
 
-status=0
+wait_for_policy=1
+[[ "${control}" == 1 ]] && wait_for_policy=0
 logfile="$(mktemp)"
-run_job "${namespace}" "${job}" probe "${secret}" '["/opt/runner/probe/probe.sh"]' 2>&1 | tee "${logfile}" || true
-grep -q "Job ${job} succeeded" "${logfile}" || status=1
+run_job "${namespace}" "${job}" probe "${secret}" '["/opt/runner/probe/probe.sh"]' "${wait_for_policy}" 2>&1 |
+  tee "${logfile}" || true
 
-if [[ "${control}" == 1 ]]; then
-  if ((status != 0)) && grep -q '^FAIL direct-anthropic' "${logfile}"; then
-    log "control: the probe failed as expected (direct egress was open without the policies)"
-  elif ((status != 0)); then
-    log "control: the probe failed, but not on direct egress; read the report above"
-  else
-    log "control: UNEXPECTED: the probe passed without NetworkPolicies, so this run does not show enforcement"
-  fi
+if [[ "${control}" != 1 ]]; then
+  grep -q "Job ${job} succeeded" "${logfile}" || exit 1
+  exit 0
 fi
-rm -f "${logfile}"
-exit "${status}"
+
+if grep -q '^probe: pod ' "${logfile}" && grep -q '^FAIL direct-anthropic' "${logfile}"; then
+  log "control: the probe failed as expected (direct egress was open without the policies)"
+  exit 1
+fi
+if grep -q "Job ${job} succeeded" "${logfile}"; then
+  log "control: UNEXPECTED: the probe passed without NetworkPolicies, so this run does not show enforcement"
+  exit 0
+fi
+log "control: inconclusive: the Job failed, but not because the probe found direct egress open (image pull, scheduling, the probe never ran, or other checks failed); read the report above"
+exit 3

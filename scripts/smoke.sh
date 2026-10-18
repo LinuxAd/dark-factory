@@ -17,12 +17,18 @@ run_id="phase0-smoke-${ts}"
 job="${run_id}"
 secret="${run_id}-token"
 
+# EXIT trap: revoke the run's gateway token and delete its Secret, both
+# best-effort, then exit with the script's own status.
 # shellcheck disable=SC2329 # invoked by the EXIT trap.
 cleanup() {
+  local rc=$?
+  revoke_token "${run_id}"
   kc --namespace "${FACTORY_SANDBOX_NAMESPACE}" delete secret "${secret}" --ignore-not-found >/dev/null 2>&1 || true
+  exit "${rc}"
 }
 trap cleanup EXIT
 
+# 1h: well inside the gateway's 2h mint-token cap; revoked on exit anyway.
 log "minting a gateway token for run ${run_id}"
 token="$(mint_token "${run_id}" smoke phase0-smoke 1h)"
 create_token_secret "${FACTORY_SANDBOX_NAMESPACE}" "${secret}" "${token}"
