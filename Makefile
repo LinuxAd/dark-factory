@@ -47,7 +47,7 @@ smoke: ## Agent SDK call from a sandbox Job through the gateway; prints its agen
 	scripts/smoke.sh
 
 .PHONY: sandbox-probe
-sandbox-probe: ## Isolation probe in a sandbox Job (AC4); CONTROL=1 runs it without NetworkPolicies and must fail
+sandbox-probe: ## Isolation probe in a sandbox Job (AC4); CONTROL=1 is the no-policy control (script exit 1 expected, 3 inconclusive)
 	CONTROL=$(or $(CONTROL),0) scripts/sandbox-probe.sh
 
 .PHONY: verify-row

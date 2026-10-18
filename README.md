@@ -47,10 +47,14 @@ Checks:
 
 ```sh
 make sandbox-probe             # isolation checks; exits 0
-make sandbox-probe CONTROL=1   # same pod, no NetworkPolicies; must fail
+make sandbox-probe CONTROL=1   # same pod, no NetworkPolicies; see below
 make smoke                     # one Agent SDK call, prints its agent_calls rows
 make verify-row ID=<id>        # one agent_calls row
 ```
+
+`make sandbox-probe CONTROL=1` is the negative control. It runs the probe without NetworkPolicies and without the Job's wait-for-policy init container. It exits 1, the expected result, only when the probe ran and reported `FAIL direct-anthropic`. It exits 3 and prints "inconclusive" when the Job failed for any other reason: the image did not pull, the pod was not scheduled, the probe never ran, or only other checks failed. It exits 0 if the probe passed, which means the control showed nothing. `make` reports every non-zero exit as 2, so run `CONTROL=1 scripts/sandbox-probe.sh` directly to see the 1 or 3; the last log line also says which.
+
+`make smoke` and `make sandbox-probe` mint a 1h gateway token for their run and revoke it on exit with `gateway revoke-token --run`. A failed revoke is logged and does not change the exit status; the token then expires at its TTL.
 
 ## Development
 

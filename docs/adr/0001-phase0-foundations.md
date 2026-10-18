@@ -30,6 +30,10 @@ The full plan, with the options weighed for each decision, is `.omc/plans/ralpla
 
 Each of these is made generic. This repo's `deploy/chart` is namespaced only, apart from its two `Namespace` objects. Rejected: a factory AppProject allowed cluster-scoped kinds. It would put the NodePool in the `workload` teardown tier and widen what a non-platform repo can create.
 
+Amended after the security review (H1): the factory deploys under its own Argo CD AppProject `factory` rather than the shared `services` project, so its Application is scoped to its own repository and namespaces instead of sharing a project with other services. This is a platform-project change, made in parallel with this branch; platform-project defines the project's exact permissions. It does not reverse the rejection above: the chart still creates nothing cluster-scoped beyond its two `Namespace` objects.
+
+The chart needs nothing from the ApplicationSet beyond its three parameters. It derives `platformName` (the first path segment), the region and the account ID from `image.repository` (`<account>.dkr.ecr.<region>.amazonaws.com/<name>/services/factory`), and builds the bucket name with the same formula as `factory.tf`: `<name>-factory-state-<account>-<region>`. Explicit `platformName`, `region` and `bucket` values override the derived ones. `make lint-chart` renders with only the three parameters and asserts the derived values.
+
 **B. Postgres backup and bring-up.**
 
 - **B1: the backup mechanism.** CloudNativePG 1.30.1 with the Barman Cloud plugin v0.15.1 (Helm chart 0.8.1, in `cnpg-system`). Backups go to an `ObjectStore` at `s3://<bucket>/cnpg` with `retentionPolicy: "30d"`, credentials `inheritFromIAMRole`, and `AWS_REGION` set on the sidecar. A `ScheduledBackup` runs nightly. Rejected: the in-tree `barmanObjectStore`, which has been deprecated since 1.26.
@@ -48,7 +52,9 @@ Each of these is made generic. This repo's `deploy/chart` is namespaced only, ap
 - FQDN NetworkPolicy: VPC CNI has no FQDN rules.
 - An in-house proxy: we would be writing a security boundary instead of reusing one.
 
-**D. Usage capture.** `httputil.ReverseProxy`, with a tee on the response body that feeds an SSE/JSON usage parser. Rows are written only for `POST /v1/messages`. The last `message_delta.usage` overwrites earlier values; values are never summed. Outbound `Accept-Encoding` is stripped. The row write survives a client cancel and is recorded with status 499. Rejected: buffering the response, which breaks streaming.
+**D. Usage capture.** `httputil.ReverseProxy`, with a tee on the response body that feeds an SSE/JSON usage parser. Rows are written only for `POST /v1/messages`.
+
+Amended after the security review (H2): the gateway forwards only an allowlist of routes, `POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /v1/models` and `GET /v1/models/{id}`. Every other path, including trailing-slash and encoded variants, gets a 404 before auth, with no upstream call and no row. Job tokens live at most 2h (`mint-token --ttl` is capped), and `make smoke` and `make sandbox-probe` revoke their run's token on exit with `gateway revoke-token --run`. The last `message_delta.usage` overwrites earlier values; values are never summed. Outbound `Accept-Encoding` is stripped. The row write survives a client cancel and is recorded with status 499. Rejected: buffering the response, which breaks streaming.
 
 **E. Key delivery.** The gateway reads `${name}/factory/anthropic-api-key` at startup with the AWS SDK, through its own Pod Identity role. The key is never in a Kubernetes Secret, so it is never in etcd. The shared External Secrets role has an explicit `Deny` on `${name}/factory/*`. Rejected:
 
@@ -74,6 +80,8 @@ A Cluster that is healthy but fails its backup aborts teardown, and teardown pri
 | Smokescreen | 443 and 80 anywhere; Smokescreen enforces the allowlist itself. Ingress from `factory-sandbox` |
 | CNPG pods (`cnpg.io/cluster In (factory-db, factory-db-seed)`, which also covers the recovery and initdb Job pods) | 443 anywhere; the Pod Identity agent. Ingress 5432 from the gateway, 8000/5432 from `cnpg-system`, 9187 from `monitoring` |
 
+Sandbox Jobs start with a `wait-for-policy` init container. It polls a direct, unproxied HTTPS call to `api.anthropic.com` for up to 60s and lets the runner container start only once that call fails, so the runner never runs in the window before VPC CNI applies the policies (security review H3). The `CONTROL=1` probe, which runs in a namespace with no policies, leaves the init container out so that the probe itself shows the open egress.
+
 ## Step 0a outcomes
 
 Recorded in [docs/research/phase0-spikes.md](../research/phase0-spikes.md). Every question came back "yes", so no fallback was needed:
@@ -87,8 +95,10 @@ Recorded in [docs/research/phase0-spikes.md](../research/phase0-spikes.md). Ever
 
 Still to check on the live cluster:
 
-- the sidecar receives Pod Identity credentials;
+- the Barman plugin sidecar receives Pod Identity credentials;
 - default-deny blocks the Pod Identity agent until the allow rule is added;
+- kubelet liveness and readiness probes reach the gateway under default-deny ingress with VPC CNI (kubelet traffic comes from the node, which no ingress rule names);
+- the factory-db role's `s3:ListBucket` works for the plugin's HeadBucket and list calls;
 - one admission test under `restricted`.
 
 ## Consequences
@@ -98,6 +108,15 @@ Still to check on the live cluster:
 - B-i turns off the two-writer guard. It is safe only because exactly two Cluster objects ever write `serverName: factory-db`, and `db-init` refuses on a non-empty prefix. During `db-init`, Argo CD's Cluster may briefly overlap the seed. That overlap is harmless: WAL names carry the timeline, and the seed holds no user data.
 - Images exist only after a merge to `main`, because CI pushes them. The first bring-up depends on that merge.
 - Raising `instances` above 1 needs a NetworkPolicy rule for 5432/8000 between CNPG pods.
+
+## Accepted for Phase 0, must fix before Phase 1
+
+Phase 0 runs only our own smoke and probe code in the sandbox. Phase 1 runs untrusted, model-written code there, and these findings from the security review must be fixed first:
+
+- **Server tools and MCP connectors (M1).** A request body can ask the API to run server-side tools (web search, web fetch, code execution) or to call MCP connectors. Those run at Anthropic, outside the sandbox, so they get around the Smokescreen allowlist. The gateway must reject or strip them.
+- **DNS exfiltration (M2).** Sandbox pods may query kube-dns, which resolves any name upstream, so data can leave encoded in DNS queries. This needs a resolver for the sandbox that answers only the names it needs.
+- **Gateway egress (L3).** The gateway may reach 443 on `0.0.0.0/0`, which includes addresses inside the VPC. It should reach only the Anthropic API and the AWS endpoints it uses.
+- **CI OIDC subject (L6, platform-wide).** The CI role trusts a wildcard OIDC subject. It should name the exact repository and ref. This is a platform-project change that affects every service.
 
 ## Follow-ups
 
