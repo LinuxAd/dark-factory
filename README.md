@@ -74,14 +74,12 @@ make images                      # build the runner and egress images locally
 
 CI (`.github/workflows/ci.yml`) runs the same checks on every pull request. On `main` it also pushes the gateway, runner and egress images, tagged with the commit SHA.
 
-Pushing on `main` needs four repository variables. A repo created from the platform's service template gets them automatically; this one did not, so set them once from platform-project's baseline outputs:
+Pushing on `main` needs four repository variables (`AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REGISTRY`, `ECR_REPOSITORY`). A repo created from the platform's service template gets them automatically; this one did not, so set them once, after platform-project's `make baseline`:
 
 ```sh
 cd ~/repos/platform-project
-gh variable set AWS_ROLE_ARN   -R LinuxAd/dark-factory --body "$(scripts/tf.sh baseline output -raw ci_role_arn)"
-gh variable set AWS_REGION     -R LinuxAd/dark-factory --body <region>
-gh variable set ECR_REGISTRY   -R LinuxAd/dark-factory --body "$(scripts/tf.sh baseline output -raw ecr_registry)"
-gh variable set ECR_REPOSITORY -R LinuxAd/dark-factory --body "$(scripts/tf.sh baseline output -raw ecr_services_prefix)/factory"
+make service-vars REPO=LinuxAd/dark-factory SERVICE=factory DRY_RUN=1   # print only
+make service-vars REPO=LinuxAd/dark-factory SERVICE=factory             # set them with gh
 ```
 
-`ECR_REPOSITORY` must be `<services prefix>/factory`: the platform's services ApplicationSet deploys `image.repository` from that path, and the runner and egress images are pushed beside it with `-runner` and `-egress` suffixes. Pull requests build the images without pushing and need none of these.
+`SERVICE=factory` makes `ECR_REPOSITORY` `<services prefix>/factory`, where the platform's services ApplicationSet deploys `image.repository` from; the runner and egress images are pushed beside it with `-runner` and `-egress` suffixes. See platform-project's runbook, "Repository variables for a service not created from a template". Pull requests build the images without pushing and need none of these.
